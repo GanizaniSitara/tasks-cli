@@ -84,8 +84,9 @@ type manifestEntry struct {
 }
 
 type Store struct {
-	config Config
-	prefix prefixConfig
+	config     Config
+	prefix     prefixConfig
+	configPath string
 }
 
 type taskIndex struct {
@@ -186,12 +187,38 @@ func printHelp() {
 
 Commands:
   summary | projects | search | get | create | update | move | reopen | delete
-  duplicates | note | attach | lint | pivot | repair | migrate | index sync|rebuild
+  duplicates | note | attach | lint | pivot | repair | migrate
+  index sync | index rebuild
 
 All successful commands emit JSON. Markdown files remain the source of truth.
 Flags may appear before or after positional arguments.
 
 Run "tasks <command> --help" (or "tasks help <command>") for command flags.`)
+	printConfigSummary()
+}
+
+// printConfigSummary reports where this installation is actually reading and
+// writing, so an agent can discover the layout by probing rather than being
+// told. Resolution can fail on a fresh machine -- help must still work there,
+// so a failure degrades to naming the overrides instead of erroring.
+func printConfigSummary() {
+	fmt.Println("\nConfiguration (TASKS_CONFIG, TASKS_ROOT, TASKS_INDEX_DIR override):")
+	store, err := newStore()
+	if err != nil {
+		fmt.Printf("  unresolved: %v\n", err)
+		return
+	}
+	for _, row := range [][2]string{
+		{"config", store.configPath},
+		{"corpus", store.config.TasksRoot},
+		{"index", store.config.IndexDir},
+		{"prefixes", store.config.AllowedPrefixesFile},
+		{"default prefix", store.config.DefaultPrefix},
+	} {
+		if row[1] != "" {
+			fmt.Printf("  %-15s %s\n", row[0], row[1])
+		}
+	}
 }
 
 // commandHelp holds one usage block per command. Flag descriptions live here
@@ -424,7 +451,7 @@ func newStore() (*Store, error) {
 		delete(prefix.TwoLetterLegacy, key)
 		prefix.TwoLetterLegacy[strings.ToUpper(key)] = value
 	}
-	return &Store{config: config, prefix: prefix}, nil
+	return &Store{config: config, prefix: prefix, configPath: configPath}, nil
 }
 
 func (s *Store) projects() []string {
