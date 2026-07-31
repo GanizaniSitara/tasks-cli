@@ -1,0 +1,4 @@
+tasks_root: C:\\Users\\you\\tasks
+index_dir: C:\\Users\\you\\AppData\\Local\\tasks-cli\\bleve
+allowed_prefixes_file: C:\\Users\\you\\AppData\\Roaming\\tasks-cli\\allowed_prefixes.yaml
+default_prefix: OP
