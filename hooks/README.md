@@ -10,15 +10,15 @@ corpus is not in front of them, they reconstruct it from memory, from the code,
 or from assumption — and confidently rebuild something you already designed and
 wrote down. The cost is not a wrong answer so much as a wasted detour.
 
-This hook runs `tasks search` against each prompt and injects the matches as one
+This hook runs `tasks-cli search` against each prompt and injects the matches as one
 line each: id, status, title, and the `codebase:` path when the ticket declares
-one. Tickets are pointers. The agent runs `tasks get <ID>` when a pointer looks
+one. Tickets are pointers. The agent runs `tasks-cli get <ID>` when a pointer looks
 worth following, so the per-turn cost stays flat no matter how long the matching
 tickets are.
 
 ## Install
 
-Requires `tasks` on `PATH` (or set `TASKS_CLI` to its full path) and Python 3.9+.
+Requires `tasks-cli` on `PATH` (or set `TASKS_CLI` to its full path) and Python 3.9+.
 
 Claude Code — add to `~/.claude/settings.json`:
 
@@ -54,7 +54,7 @@ Empty output means nothing matched — which is a valid answer, not a failure.
 
 ## Behaviour
 
-- **Read-only.** It only ever runs `tasks search`.
+- **Read-only.** It only ever runs `tasks-cli search`.
 - **Fail-open.** Any error, timeout, malformed input or empty result yields empty
   stdout and exit 0. A prompt is never blocked by this hook.
 - **Bounded.** At most 5 tickets per turn and 60 lines per session, so a long
@@ -71,7 +71,7 @@ surface a DNS ticket if nothing better exists.
 
 Two guards:
 
-1. `tasks search` reports whether it matched **every** query term (`bleve`) or
+1. `tasks-cli search` reports whether it matched **every** query term (`bleve`) or
    fell back to any-term matching (`bleve-relaxed`).
 2. A relaxed answer is filtered by how many query words each ticket actually
    contains. That floor scales with the query: two shared words mean nothing in

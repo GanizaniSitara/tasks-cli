@@ -126,7 +126,7 @@ func run(args []string) error {
 		printHelp()
 		return nil
 	}
-	// "tasks help create" and "tasks create --help" both resolve command help.
+	// "tasks-cli help create" and "tasks-cli create --help" both resolve command help.
 	// Only the leading position is treated as a help request, so a flag value
 	// that happens to be "-h" or "--help" is still passed through as data.
 	if args[0] == "help" {
@@ -178,12 +178,12 @@ func run(args []string) error {
 	case "index":
 		return commandIndex(store, index, args[1:])
 	default:
-		return fmt.Errorf("unknown command %q; run tasks help", args[0])
+		return fmt.Errorf("unknown command %q; run tasks-cli help", args[0])
 	}
 }
 
 func printHelp() {
-	fmt.Println(`tasks <command> [flags]
+	fmt.Println(`tasks-cli <command> [flags]
 
 Commands:
   summary | projects | search | get | create | update | move | reopen | delete
@@ -193,7 +193,7 @@ Commands:
 All successful commands emit JSON. Markdown files remain the source of truth.
 Flags may appear before or after positional arguments.
 
-Run "tasks <command> --help" (or "tasks help <command>") for command flags.`)
+Run "tasks-cli <command> --help" (or "tasks-cli help <command>") for command flags.`)
 	printConfigSummary()
 }
 
@@ -225,24 +225,24 @@ func printConfigSummary() {
 // rather than in each FlagSet because every FlagSet discards its own output,
 // so the flag package never prints them.
 var commandHelp = map[string]string{
-	"summary": `tasks summary
+	"summary": `tasks-cli summary
 
 Counts per status, per-prefix totals, and the index location. No flags.`,
 
-	"projects": `tasks projects
+	"projects": `tasks-cli projects
 
 Allowed project prefixes from the configured allowlist. No flags.`,
 
-	"duplicates": `tasks duplicates
+	"duplicates": `tasks-cli duplicates
 
 Task IDs that appear in more than one file. No flags.`,
 
-	"lint": `tasks lint
+	"lint": `tasks-cli lint
 
 Corpus integrity report: duplicate IDs, missing prefixes, orphan companion
 directories, non-normalized priorities, and status mismatches. No flags.`,
 
-	"search": `tasks search [QUERY] [flags]
+	"search": `tasks-cli search [QUERY] [flags]
 
 Search the Bleve index. With no QUERY, lists tasks from disk instead, which is
 how you enumerate a status (there is no separate "list" command).
@@ -262,14 +262,14 @@ sync.matched:
   bleve-relaxed  fallback -- results share only some terms, so treat them as
                  candidates and check each one before relying on it
 
-  tasks search "wine scraper" --limit 5
-  tasks search --status in-progress --prefix PROJ`,
+  tasks-cli search "wine scraper" --limit 5
+  tasks-cli search --status in-progress --prefix PROJ`,
 
-	"get": `tasks get TASK-ID
+	"get": `tasks-cli get TASK-ID
 
 One task with its frontmatter, body, and companion asset paths. No flags.`,
 
-	"create": `tasks create --title TEXT [flags]
+	"create": `tasks-cli create --title TEXT [flags]
 
 Create a task and its companion directory. The prefix must already be in the
 allowlist; the command will not invent a new project code.
@@ -283,12 +283,12 @@ allowlist; the command will not invent a new project code.
   --priority P0..P5
   --tag TAG                repeat the flag for multiple tags
 
-  tasks create --title "Index companion files" --prefix PROJ --tag go --tag cli`,
+  tasks-cli create --title "Index companion files" --prefix PROJ --tag go --tag cli`,
 
-	"update": `tasks update TASK-ID [flags]
+	"update": `tasks-cli update TASK-ID [flags]
 
 Update metadata or body. Only the flags you pass are changed. Renaming the
-title does not rename the file; run "tasks migrate" to reconcile file stems.
+title does not rename the file; run "tasks-cli migrate" to reconcile file stems.
 
   --title TEXT
   --description TEXT
@@ -299,24 +299,24 @@ title does not rename the file; run "tasks migrate" to reconcile file stems.
   --tag TAG                repeat the flag for multiple tags
   --clear-tags             drop all existing tags
 
-  tasks update PROJ-092 --priority P1 --tag go`,
+  tasks-cli update PROJ-092 --priority P1 --tag go`,
 
-	"move": `tasks move TASK-ID STATUS [flags]
+	"move": `tasks-cli move TASK-ID STATUS [flags]
 
 Move a task and its companion directory to another status directory.
 
   --strategy error|replace|merge   companion-directory collision handling
                                    (default error)
 
-  tasks move PROJ-092 done`,
+  tasks-cli move PROJ-092 done`,
 
-	"reopen": `tasks reopen TASK-ID [flags]
+	"reopen": `tasks-cli reopen TASK-ID [flags]
 
 Move a done task back into an active status and append a History note.
 
   --status STATUS   backlog | in-progress | blocked (default backlog)`,
 
-	"delete": `tasks delete TASK-ID --confirm TASK-ID [flags]
+	"delete": `tasks-cli delete TASK-ID --confirm TASK-ID [flags]
 
 Delete a task file and its companion directory. Deliberately explicit: the
 --confirm value must repeat the task ID.
@@ -324,7 +324,7 @@ Delete a task file and its companion directory. Deliberately explicit: the
   --confirm TASK-ID   required, must match
   --path EXACT-PATH   disambiguate when the ID resolves to several files`,
 
-	"note": `tasks note TASK-ID --note TEXT [flags]
+	"note": `tasks-cli note TASK-ID --note TEXT [flags]
 
 Append a timestamped note under a heading, creating the heading if absent.
 
@@ -332,14 +332,14 @@ Append a timestamped note under a heading, creating the heading if absent.
   --note-file PATH    read the note from a file
   --heading NAME      target heading (default Notes)`,
 
-	"attach": `tasks attach TASK-ID FILE
+	"attach": `tasks-cli attach TASK-ID FILE
 
 Copy FILE into the task's companion directory and index its text. Takes two
 positional arguments and no flags.
 
-  tasks attach PROJ-092 C:\reports\verification.txt`,
+  tasks-cli attach PROJ-092 C:\reports\verification.txt`,
 
-	"pivot": `tasks pivot [flags]
+	"pivot": `tasks-cli pivot [flags]
 
 Cross-tabulate the corpus.
 
@@ -349,7 +349,7 @@ Cross-tabulate the corpus.
   --priorities LIST   comma-separated priorities to include
   --projects LIST     comma-separated projects to include`,
 
-	"repair": `tasks repair --fix FIX [flags]
+	"repair": `tasks-cli repair --fix FIX [flags]
 
 Dry-run unless --apply is given. Requires at least one --fix.
 
@@ -360,17 +360,17 @@ Dry-run unless --apply is given. Requires at least one --fix.
                                   (REBUILD_WHOOSH is a legacy alias for this)
   --apply                         perform the changes
 
-  tasks repair --fix NORMALIZE_PRIORITY
-  tasks repair --fix NORMALIZE_PRIORITY --apply`,
+  tasks-cli repair --fix NORMALIZE_PRIORITY
+  tasks-cli repair --fix NORMALIZE_PRIORITY --apply`,
 
-	"migrate": `tasks migrate [flags]
+	"migrate": `tasks-cli migrate [flags]
 
 Reconcile legacy filenames and file stems with canonical task IDs and titles.
 Dry-run unless --apply is given.
 
   --apply   perform the renames`,
 
-	"index": `tasks index sync|rebuild
+	"index": `tasks-cli index sync|rebuild
 
   sync      index only tasks whose files changed since the last run
   rebuild   discard the index and rebuild it from every markdown file
@@ -382,7 +382,7 @@ changed the corpus.`,
 func printCommandHelp(command string) error {
 	text, ok := commandHelp[command]
 	if !ok {
-		return fmt.Errorf("unknown command %q; run tasks help", command)
+		return fmt.Errorf("unknown command %q; run tasks-cli help", command)
 	}
 	fmt.Println(text)
 	return nil
@@ -1366,7 +1366,7 @@ func snippet(content, query string) string {
 
 func commandGet(store *Store, args []string) error {
 	if len(args) != 1 {
-		return fmt.Errorf("usage: tasks get TASK-ID")
+		return fmt.Errorf("usage: tasks-cli get TASK-ID")
 	}
 	task, err := store.find(args[0])
 	if err != nil {
@@ -1482,7 +1482,7 @@ func commandUpdate(store *Store, idx taskIndex, args []string) error {
 		return err
 	}
 	if len(fs.Args()) != 1 {
-		return fmt.Errorf("usage: tasks update TASK-ID [flags]")
+		return fmt.Errorf("usage: tasks-cli update TASK-ID [flags]")
 	}
 	if description.set && *descriptionFile != "" {
 		return fmt.Errorf("use one of --description or --description-file")
@@ -1563,7 +1563,7 @@ func commandMove(store *Store, idx taskIndex, args []string) error {
 		return err
 	}
 	if len(fs.Args()) != 2 {
-		return fmt.Errorf("usage: tasks move TASK-ID STATUS [--strategy error|replace|merge]")
+		return fmt.Errorf("usage: tasks-cli move TASK-ID STATUS [--strategy error|replace|merge]")
 	}
 	targetStatus, err := normalizeStatus(fs.Args()[1])
 	if err != nil {
@@ -1674,7 +1674,7 @@ func commandReopen(store *Store, idx taskIndex, args []string) error {
 		return err
 	}
 	if len(fs.Args()) != 1 {
-		return fmt.Errorf("usage: tasks reopen TASK-ID [--status backlog|in-progress]")
+		return fmt.Errorf("usage: tasks-cli reopen TASK-ID [--status backlog|in-progress]")
 	}
 	target, err := normalizeStatus(*status)
 	if err != nil {
@@ -1713,7 +1713,7 @@ func commandDelete(store *Store, idx taskIndex, args []string) error {
 		return err
 	}
 	if len(fs.Args()) != 1 {
-		return fmt.Errorf("usage: tasks delete TASK-ID --confirm TASK-ID [--path EXACT-PATH]")
+		return fmt.Errorf("usage: tasks-cli delete TASK-ID --confirm TASK-ID [--path EXACT-PATH]")
 	}
 	id := fs.Args()[0]
 	if !strings.EqualFold(id, *confirm) {
@@ -1795,7 +1795,7 @@ func commandNote(store *Store, idx taskIndex, args []string) error {
 		return err
 	}
 	if len(fs.Args()) != 1 || (*note == "" && *noteFile == "") || (*note != "" && *noteFile != "") {
-		return fmt.Errorf("usage: tasks note TASK-ID --note TEXT|--note-file PATH [--heading NAME]")
+		return fmt.Errorf("usage: tasks-cli note TASK-ID --note TEXT|--note-file PATH [--heading NAME]")
 	}
 	if *noteFile != "" {
 		raw, err := os.ReadFile(*noteFile)
@@ -1825,7 +1825,7 @@ func commandNote(store *Store, idx taskIndex, args []string) error {
 
 func commandAttach(store *Store, idx taskIndex, args []string) error {
 	if len(args) != 2 {
-		return fmt.Errorf("usage: tasks attach TASK-ID FILE")
+		return fmt.Errorf("usage: tasks-cli attach TASK-ID FILE")
 	}
 	return withLock(store.config.TasksRoot, func() error {
 		task, err := store.find(args[0])
@@ -2160,7 +2160,7 @@ func commandMigrate(store *Store, idx taskIndex, args []string) error {
 
 func commandIndex(store *Store, idx taskIndex, args []string) error {
 	if len(args) != 1 || (args[0] != "sync" && args[0] != "rebuild") {
-		return fmt.Errorf("usage: tasks index sync|rebuild")
+		return fmt.Errorf("usage: tasks-cli index sync|rebuild")
 	}
 	var result map[string]interface{}
 	var err error

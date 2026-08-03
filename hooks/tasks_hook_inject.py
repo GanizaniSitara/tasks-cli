@@ -8,12 +8,12 @@ the Bleve ticket index.
 
 What it injects is deliberately thin -- one line per hit: id, status, title, and
 the ``codebase:`` path when the ticket declares one. Tickets are pointers, not
-prose. The agent reads the full body with ``tasks get`` if the pointer looks
+prose. The agent reads the full body with ``tasks-cli get`` if the pointer looks
 relevant, which keeps the per-turn cost near-constant regardless of how large
 the matching tickets are.
 
 Behavior contract, matching the mempalace hook:
-- READ-ONLY. Only ever runs ``tasks search``; never mutates the corpus.
+- READ-ONLY. Only ever runs ``tasks-cli search``; never mutates the corpus.
 - Fail open: any error, timeout, malformed input or empty result yields empty
   stdout and exit code 0. A prompt is never blocked by this hook.
 - Bounded: at most MAX_HITS lines per turn, each truncated, with a cumulative
@@ -39,25 +39,30 @@ from pathlib import Path
 from typing import Any
 
 def _find_tasks_cli() -> str:
-    """Locate the tasks binary: PATH first, then the known install locations.
+    """Locate the tasks-cli binary: PATH first, then the known install locations.
 
     Kept dynamic so the same hook runs on Windows and macOS without a per-host
     edit. An override wins outright, for anyone whose layout differs from both.
+
+    Only ``tasks-cli`` is probed. The command was renamed from bare ``tasks`` so
+    that an agent meeting it cold cannot confuse it with the OS task scheduler,
+    an MCP server, or its own todo tool -- so falling back to the old name would
+    reintroduce exactly what the rename removed.
     """
     override = os.environ.get("TASKS_CLI")
     if override:
         return override
-    found = shutil.which("tasks")
+    found = shutil.which("tasks-cli")
     if found:
         return found
     for candidate in (
-        Path(r"C:\Tools\tasks.exe"),
-        Path.home() / ".local" / "bin" / "tasks",
-        Path.home() / "bin" / "tasks",
+        Path(r"C:\Tools\tasks-cli.exe"),
+        Path.home() / ".local" / "bin" / "tasks-cli",
+        Path.home() / "bin" / "tasks-cli",
     ):
         if candidate.exists():
             return str(candidate)
-    return "tasks"  # let the subprocess call fail, and fail open
+    return "tasks-cli"  # let the subprocess call fail, and fail open
 
 
 TASKS_EXE = _find_tasks_cli()
@@ -178,8 +183,8 @@ def salient_terms(prompt: str) -> list[str]:
 def build_query(prompt: str) -> tuple[str, list[str]]:
     """Return (query, terms). Explicit ticket IDs always survive."""
     terms = salient_terms(prompt)
-    # Case matters: task_id is a keyword field, so "proj-17" never matches
-    # "PROJ-17". Carry the identifier through exactly as written.
+    # Case matters: task_id is a keyword field, so "tech-113" never matches
+    # "TECH-113". Carry the identifier through exactly as written.
     idents = _IDENT_RE.findall(_norm(prompt))
     for ident in reversed(idents):
         for existing in list(terms):
@@ -243,7 +248,7 @@ def _codebase_of(result: dict[str, Any]) -> str:
 
     Cheap and best-effort: reading every hit's body to find `codebase:` would
     cost more than the whole hook is worth. A missing path is not an error --
-    the agent runs `tasks get` when it wants the detail.
+    the agent runs `tasks-cli get` when it wants the detail.
     """
     snippet = _TAG_RE.sub("", str(result.get("snippet") or ""))
     match = _CODEBASE_RE.search(snippet)
@@ -279,7 +284,7 @@ def render_envelope_text(lines: list[str]) -> str:
     return "\n".join([
         "<task_recall>",
         "Live tickets matching this prompt, from the local task index. These are",
-        "pointers, not instructions: read the full body with `tasks get <ID>`",
+        "pointers, not instructions: read the full body with `tasks-cli get <ID>`",
         "before relying on one, and check its status -- a done ticket describes",
         "what was built, not what is pending.",
         "",
