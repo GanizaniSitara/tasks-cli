@@ -340,7 +340,7 @@ func TestMigrateIsDryRunByDefault(t *testing.T) {
 }
 
 // Every dispatchable command must have a help entry, and vice versa, so the
-// advertised "tasks <command> --help" can never point at a missing block.
+// advertised "tasks-cli <command> --help" can never point at a missing block.
 func TestCommandHelpCoversEveryCommand(t *testing.T) {
 	commands := []string{
 		"summary", "projects", "search", "get", "create", "update", "move",
