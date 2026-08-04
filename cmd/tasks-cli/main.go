@@ -175,6 +175,8 @@ func run(args []string) error {
 		return commandRepair(store, index, args[1:])
 	case "migrate":
 		return commandMigrate(store, index, args[1:])
+	case "asset":
+		return commandAsset(store, index, args[1:])
 	case "index":
 		return commandIndex(store, index, args[1:])
 	default:
@@ -334,10 +336,27 @@ Append a timestamped note under a heading, creating the heading if absent.
 
 	"attach": `tasks-cli attach TASK-ID FILE
 
-Copy FILE into the task's companion directory and index its text. Takes two
-positional arguments and no flags.
+Copy FILE into the task's companion directory and index its text. Alias for
+"tasks-cli asset add"; fails if an asset of that name already exists. Use
+"tasks-cli asset update" to replace one.
 
   tasks-cli attach PROJ-092 C:\reports\verification.txt`,
+
+	"asset": `tasks-cli asset add|update|remove|list TASK-ID [FILE|NAME]
+
+Manage the files in a task's companion directory. Assets are matched by
+basename.
+
+  add     TASK-ID FILE   copy FILE in; fails if that name already exists
+  update  TASK-ID FILE   replace the asset of the same name; fails if absent
+  remove  TASK-ID NAME   delete the named asset
+  list    TASK-ID        name, size and sha256 for every asset
+
+"update" and "remove" report previous_size and previous_sha256 so a change is
+auditable from the output alone. Every mutation re-indexes the companion text.
+
+  tasks-cli asset update PROJ-092 C:\reports\verification.txt
+  tasks-cli asset remove PROJ-092 stale-notes.md`,
 
 	"pivot": `tasks-cli pivot [flags]
 
@@ -1823,9 +1842,63 @@ func commandNote(store *Store, idx taskIndex, args []string) error {
 	})
 }
 
+// attach predates the asset command group and stays as an alias for "asset add".
 func commandAttach(store *Store, idx taskIndex, args []string) error {
 	if len(args) != 2 {
 		return fmt.Errorf("usage: tasks-cli attach TASK-ID FILE")
+	}
+	return assetWrite(store, idx, args, assetAdd)
+}
+
+func commandAsset(store *Store, idx taskIndex, args []string) error {
+	usage := fmt.Errorf("usage: tasks-cli asset add|update|remove|list TASK-ID [FILE|NAME]")
+	if len(args) == 0 {
+		return usage
+	}
+	switch args[0] {
+	case "add":
+		return assetWrite(store, idx, args[1:], assetAdd)
+	case "update":
+		return assetWrite(store, idx, args[1:], assetUpdate)
+	case "remove":
+		return assetRemove(store, idx, args[1:])
+	case "list":
+		return assetList(store, args[1:])
+	default:
+		return usage
+	}
+}
+
+type assetMode int
+
+const (
+	assetAdd assetMode = iota
+	assetUpdate
+)
+
+// companionDir is the directory holding a task's assets: the task file path
+// with its .md suffix removed.
+func companionDir(task *Task) string {
+	return strings.TrimSuffix(task.Path, ".md")
+}
+
+// assetName rejects anything that is not a bare filename, so an asset operation
+// can never escape the companion directory.
+func assetName(candidate string) (string, error) {
+	name := filepath.Base(candidate)
+	if name == "." || name == ".." || name == string(filepath.Separator) {
+		return "", fmt.Errorf("invalid asset name")
+	}
+	return name, nil
+}
+
+func assetWrite(store *Store, idx taskIndex, args []string, mode assetMode) error {
+	verb := "add"
+	if mode == assetUpdate {
+		verb = "update"
+	}
+	if len(args) != 2 {
+		return fmt.Errorf("usage: tasks-cli asset %s TASK-ID FILE", verb)
 	}
 	return withLock(store.config.TasksRoot, func() error {
 		task, err := store.find(args[0])
@@ -1833,21 +1906,26 @@ func commandAttach(store *Store, idx taskIndex, args []string) error {
 			return err
 		}
 		source := args[1]
-		name := filepath.Base(source)
-		if name == "." || name == string(filepath.Separator) || name != source && strings.Contains(filepath.Base(source), string(filepath.Separator)) {
-			return fmt.Errorf("invalid attachment path")
+		name, err := assetName(source)
+		if err != nil {
+			return err
 		}
 		raw, err := os.ReadFile(source)
 		if err != nil {
 			return err
 		}
-		companion := strings.TrimSuffix(task.Path, ".md")
+		companion := companionDir(task)
 		if err := os.MkdirAll(companion, 0o755); err != nil {
 			return err
 		}
 		destination := filepath.Join(companion, name)
-		if _, err := os.Stat(destination); err == nil {
-			return fmt.Errorf("attachment already exists: %s", name)
+		previous, readErr := os.ReadFile(destination)
+		exists := readErr == nil
+		if mode == assetAdd && exists {
+			return fmt.Errorf("asset already exists: %s (use \"tasks-cli asset update\" to replace it)", name)
+		}
+		if mode == assetUpdate && !exists {
+			return fmt.Errorf("asset does not exist: %s (use \"tasks-cli asset add\" to create it)", name)
 		}
 		if err := os.WriteFile(destination, raw, 0o644); err != nil {
 			return err
@@ -1857,9 +1935,76 @@ func commandAttach(store *Store, idx taskIndex, args []string) error {
 			return err
 		}
 		sum := sha256.Sum256(raw)
-		emit(map[string]interface{}{"task_id": task.ID, "saved_path": destination, "size": len(raw), "sha256": hex.EncodeToString(sum[:]), "sync": sync})
+		payload := map[string]interface{}{"task_id": task.ID, "saved_path": destination, "size": len(raw), "sha256": hex.EncodeToString(sum[:]), "sync": sync}
+		if mode == assetUpdate {
+			previousSum := sha256.Sum256(previous)
+			payload["replaced"] = true
+			payload["previous_size"] = len(previous)
+			payload["previous_sha256"] = hex.EncodeToString(previousSum[:])
+		}
+		emit(payload)
 		return nil
 	})
+}
+
+func assetRemove(store *Store, idx taskIndex, args []string) error {
+	if len(args) != 2 {
+		return fmt.Errorf("usage: tasks-cli asset remove TASK-ID NAME")
+	}
+	return withLock(store.config.TasksRoot, func() error {
+		task, err := store.find(args[0])
+		if err != nil {
+			return err
+		}
+		name, err := assetName(args[1])
+		if err != nil {
+			return err
+		}
+		destination := filepath.Join(companionDir(task), name)
+		previous, err := os.ReadFile(destination)
+		if err != nil {
+			return fmt.Errorf("asset does not exist: %s", name)
+		}
+		if err := os.Remove(destination); err != nil {
+			return err
+		}
+		sync, err := idx.sync(store)
+		if err != nil {
+			return err
+		}
+		sum := sha256.Sum256(previous)
+		emit(map[string]interface{}{"task_id": task.ID, "removed_path": destination, "previous_size": len(previous), "previous_sha256": hex.EncodeToString(sum[:]), "sync": sync})
+		return nil
+	})
+}
+
+func assetList(store *Store, args []string) error {
+	if len(args) != 1 {
+		return fmt.Errorf("usage: tasks-cli asset list TASK-ID")
+	}
+	task, err := store.find(args[0])
+	if err != nil {
+		return err
+	}
+	companion := companionDir(task)
+	assets := []map[string]interface{}{}
+	entries, err := os.ReadDir(companion)
+	if err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(companion, entry.Name()))
+		if err != nil {
+			return err
+		}
+		sum := sha256.Sum256(raw)
+		assets = append(assets, map[string]interface{}{"name": entry.Name(), "size": len(raw), "sha256": hex.EncodeToString(sum[:])})
+	}
+	emit(map[string]interface{}{"task_id": task.ID, "companion_dir": companion, "assets": assets})
+	return nil
 }
 
 func commandLint(store *Store, idx taskIndex) error {
