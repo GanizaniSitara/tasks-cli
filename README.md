@@ -14,7 +14,15 @@ The command prints JSON so coding agents can use it safely from a shell.
 
 ## Commands
 
-`summary`, `projects`, `search`, `get`, `create`, `update`, `move`, `reopen`, `delete`, `duplicates`, `note`, `attach`, `lint`, `pivot`, `repair`, `migrate`, and `index sync|rebuild`.
+`summary`, `projects`, `search`, `get`, `create`, `update`, `move`, `reopen`, `delete`, `duplicates`, `note`, `attach`, `asset add|update|remove|list`, `lint`, `pivot`, `repair`, `migrate`, and `index sync|rebuild`.
+
+Tickets and their companion assets each get a full set of verbs: `create`/`update`
+for the ticket body, `asset add`/`asset update`/`asset remove` for the files beside
+it. `attach` remains as an alias for `asset add`. Because direct filesystem edits to
+the corpus are typically denied so the CLI stays the only writer, an asset that could
+only be created and never revised was effectively write-once; `asset update` closes
+that. Replacements and removals report `previous_size` and `previous_sha256` so the
+change is auditable from the JSON alone.
 
 `tasks-cli help` lists the commands. `tasks-cli <command> --help` (or
 `tasks-cli help <command>`) prints that command's flags, defaults, and an example —

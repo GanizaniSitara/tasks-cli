@@ -290,6 +290,90 @@ func TestAttachCopiesFileIntoCompanionDir(t *testing.T) {
 	if err := tasks("attach", "OP-001"); err == nil {
 		t.Error("expected attach without a file argument to fail")
 	}
+	if err := tasks("attach", "OP-001", source); err == nil {
+		t.Error("expected attach onto an existing asset name to fail")
+	}
+}
+
+// Companion assets have to be revisable: a document attached with a wrong fact
+// in it was previously uncorrectable through any sanctioned path.
+func TestAssetUpdateReplacesExistingAsset(t *testing.T) {
+	tasks := sandboxRun(t)
+	if err := tasks("create", "--title", "Needs revision", "--prefix", "OP"); err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	source := filepath.Join(dir, "brief.md")
+	if err := os.WriteFile(source, []byte("original, with a wrong number"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks("asset", "update", "OP-001", source); err == nil {
+		t.Error("expected asset update to fail when the asset does not exist yet")
+	}
+	if err := tasks("asset", "add", "OP-001", source); err != nil {
+		t.Fatalf("asset add: %v", err)
+	}
+	if err := tasks("asset", "add", "OP-001", source); err == nil {
+		t.Error("expected asset add to fail when the name already exists")
+	}
+	if err := os.WriteFile(source, []byte("corrected"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks("asset", "update", "OP-001", source); err != nil {
+		t.Fatalf("asset update: %v", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(os.Getenv("TASKS_ROOT"), "backlog", "OP-001-*", "brief.md"))
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("asset not in companion dir: %v (err %v)", matches, err)
+	}
+	got, err := os.ReadFile(matches[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != "corrected" {
+		t.Errorf("asset was not replaced, got %q", got)
+	}
+}
+
+func TestAssetRemoveAndList(t *testing.T) {
+	tasks := sandboxRun(t)
+	if err := tasks("create", "--title", "Has assets", "--prefix", "OP"); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(t.TempDir(), "report.txt")
+	if err := os.WriteFile(source, []byte("findings"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks("asset", "add", "OP-001", source); err != nil {
+		t.Fatalf("asset add: %v", err)
+	}
+	if err := tasks("asset", "list", "OP-001"); err != nil {
+		t.Fatalf("asset list: %v", err)
+	}
+	if err := tasks("asset", "remove", "OP-001", "report.txt"); err != nil {
+		t.Fatalf("asset remove: %v", err)
+	}
+	matches, err := filepath.Glob(filepath.Join(os.Getenv("TASKS_ROOT"), "backlog", "OP-001-*", "report.txt"))
+	if err != nil || len(matches) != 0 {
+		t.Errorf("expected asset to be gone, got %v (err %v)", matches, err)
+	}
+	if err := tasks("asset", "remove", "OP-001", "report.txt"); err == nil {
+		t.Error("expected removing a missing asset to fail")
+	}
+	if err := tasks("asset", "list", "OP-001"); err != nil {
+		t.Errorf("asset list on an empty companion dir should succeed: %v", err)
+	}
+}
+
+// An asset name must never escape the companion directory.
+func TestAssetRemoveRejectsPathTraversal(t *testing.T) {
+	tasks := sandboxRun(t)
+	if err := tasks("create", "--title", "Guarded", "--prefix", "OP"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks("asset", "remove", "OP-001", "../../escape.md"); err == nil {
+		t.Error("expected a traversing asset name to be rejected")
+	}
 }
 
 func TestReopenOnlyFromDone(t *testing.T) {
@@ -344,7 +428,7 @@ func TestMigrateIsDryRunByDefault(t *testing.T) {
 func TestCommandHelpCoversEveryCommand(t *testing.T) {
 	commands := []string{
 		"summary", "projects", "search", "get", "create", "update", "move",
-		"reopen", "delete", "duplicates", "note", "attach", "lint", "pivot",
+		"reopen", "delete", "duplicates", "note", "attach", "asset", "lint", "pivot",
 		"repair", "migrate", "index",
 	}
 	for _, command := range commands {
