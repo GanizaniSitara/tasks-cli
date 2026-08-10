@@ -11,9 +11,11 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/blevesearch/bleve/v2"
@@ -984,6 +986,53 @@ func (s *Store) writeTask(task *Task) error {
 	return writeAtomic(task.Path, text)
 }
 
+// processAlive reports whether a pid currently exists. Both hosts that run this
+// binary are covered: on Windows os.FindProcess opens a handle and fails when
+// the process is gone, while on Unix it always succeeds and liveness has to be
+// probed with signal 0. An EPERM there means the process exists but belongs to
+// somebody else, which still counts as alive.
+//
+// Every uncertain answer is "alive", so the caller waits rather than reclaims.
+func processAlive(pid int) bool {
+	proc, err := os.FindProcess(pid)
+	if err != nil {
+		return false
+	}
+	if runtime.GOOS == "windows" {
+		return true
+	}
+	if err := proc.Signal(syscall.Signal(0)); err != nil {
+		return errors.Is(err, os.ErrPermission)
+	}
+	return true
+}
+
+// lockOwnerDead reports whether the pid recorded in a lock file is definitely
+// gone. It is deliberately conservative: anything it cannot establish — missing
+// file, unparseable pid, a live process, or an error it does not understand —
+// returns false and leaves the lock alone. Wrongly reclaiming a held lock lets
+// two writers into the corpus at once; wrongly waiting only costs time, and the
+// age fallback still clears it eventually.
+func lockOwnerDead(path string) bool {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return false
+	}
+	pid := 0
+	for _, line := range strings.Split(string(data), "\n") {
+		if rest, found := strings.CutPrefix(strings.TrimSpace(line), "pid="); found {
+			if parsed, convErr := strconv.Atoi(rest); convErr == nil {
+				pid = parsed
+			}
+			break
+		}
+	}
+	if pid <= 0 || pid == os.Getpid() {
+		return false
+	}
+	return !processAlive(pid)
+}
+
 func withLock(root string, fn func() error) error {
 	path := filepath.Join(root, ".tasks-cli.lock")
 	if err := os.MkdirAll(root, 0o755); err != nil {
@@ -991,9 +1040,25 @@ func withLock(root string, fn func() error) error {
 	}
 	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
 	if err != nil {
-		if info, statErr := os.Stat(path); statErr == nil && time.Since(info.ModTime()) > 30*time.Minute {
+		// The lock is released by the deferred Remove below, so any abnormal exit
+		// — killed process, panic, closed pipe — orphans it. Two independent
+		// staleness tests, cheapest first.
+		//
+		// Liveness: the lock records the owning pid, so ask whether that process
+		// still exists. A dead owner means the lock cannot be released by anyone
+		// and is reclaimable immediately, however recently it was written.
+		if lockOwnerDead(path) {
 			_ = os.Remove(path)
 			file, err = os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		}
+		// Age: the fallback for when the pid is unreadable or has been recycled
+		// onto an unrelated process. Deliberately long, because reclaiming a lock
+		// a live writer still holds is far worse than waiting.
+		if err != nil {
+			if info, statErr := os.Stat(path); statErr == nil && time.Since(info.ModTime()) > 30*time.Minute {
+				_ = os.Remove(path)
+				file, err = os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+			}
 		}
 		if err != nil {
 			return fmt.Errorf("task corpus is busy: %w", err)
