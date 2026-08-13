@@ -11,7 +11,7 @@ The practical difference is quite large:
 - there is no server process, port or session to keep alive;
 - every coding agent can already use a shell, so there is no agent-specific MCP setup;
 - the input and output are easy to inspect; and
-- the whole thing tests like a normal program, in about a second.
+- the whole thing tests like a normal program.
 
 This isn't an argument against MCP. It earns its keep for remote services and genuinely stateful integrations. For a local corpus of files, I found that a running server was ceremony around something a command already did.
 
