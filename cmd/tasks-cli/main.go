@@ -269,9 +269,12 @@ sync.matched:
   tasks-cli search "wine scraper" --limit 5
   tasks-cli search --status in-progress --prefix PROJ`,
 
-	"get": `tasks-cli get TASK-ID
+	"get": `tasks-cli get TASK-ID [--path EXACT-PATH]
 
-One task with its frontmatter, body, and companion asset paths. No flags.`,
+One task with its frontmatter, body, and companion asset paths.
+
+Flags:
+  --path EXACT-PATH   disambiguate when the ID resolves to several files`,
 
 	"create": `tasks-cli create --title TEXT [flags]
 
@@ -309,8 +312,9 @@ title does not rename the file; run "tasks-cli migrate" to reconcile file stems.
 
 Move a task and its companion directory to another status directory.
 
-  --strategy error|replace|merge   companion-directory collision handling
-                                   (default error)
+	--path EXACT-PATH                  disambiguate when the ID resolves to several files
+	--strategy error|replace|merge   companion-directory collision handling
+	                                 (default error)
 
   tasks-cli move PROJ-092 done`,
 
@@ -904,6 +908,10 @@ func sortedBoolKeys(values map[string]bool) []string {
 }
 
 func (s *Store) find(taskID string) (*Task, error) {
+	return s.findAtPath(taskID, "")
+}
+
+func (s *Store) findAtPath(taskID, exactPath string) (*Task, error) {
 	tasks, err := s.scanTasks()
 	if err != nil {
 		return nil, err
@@ -911,7 +919,7 @@ func (s *Store) find(taskID string) (*Task, error) {
 	needle := strings.ToUpper(strings.TrimSpace(taskID))
 	var matches []*Task
 	for _, task := range tasks {
-		if strings.ToUpper(task.ID) == needle {
+		if strings.ToUpper(task.ID) == needle && (exactPath == "" || samePath(task.Path, exactPath)) {
 			matches = append(matches, task)
 		}
 	}
@@ -922,6 +930,15 @@ func (s *Store) find(taskID string) (*Task, error) {
 		return nil, fmt.Errorf("task %q has %d copies; use duplicates and an exact path", taskID, len(matches))
 	}
 	return matches[0], nil
+}
+
+func samePath(left, right string) bool {
+	leftAbs, leftErr := filepath.Abs(left)
+	rightAbs, rightErr := filepath.Abs(right)
+	if leftErr == nil && rightErr == nil {
+		left, right = leftAbs, rightAbs
+	}
+	return strings.EqualFold(filepath.Clean(left), filepath.Clean(right))
 }
 
 func writeAtomic(path, text string) error {
@@ -1449,10 +1466,16 @@ func snippet(content, query string) string {
 }
 
 func commandGet(store *Store, args []string) error {
-	if len(args) != 1 {
-		return fmt.Errorf("usage: tasks-cli get TASK-ID")
+	fs := flag.NewFlagSet("get", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	path := fs.String("path", "", "")
+	if err := parseInterspersed(fs, args); err != nil {
+		return err
 	}
-	task, err := store.find(args[0])
+	if len(fs.Args()) != 1 {
+		return fmt.Errorf("usage: tasks-cli get TASK-ID [--path EXACT-PATH]")
+	}
+	task, err := store.findAtPath(fs.Args()[0], *path)
 	if err != nil {
 		return err
 	}
@@ -1642,19 +1665,20 @@ func commandUpdate(store *Store, idx taskIndex, args []string) error {
 func commandMove(store *Store, idx taskIndex, args []string) error {
 	fs := flag.NewFlagSet("move", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
+	path := fs.String("path", "", "")
 	strategy := fs.String("strategy", "error", "")
 	if err := parseInterspersed(fs, args); err != nil {
 		return err
 	}
 	if len(fs.Args()) != 2 {
-		return fmt.Errorf("usage: tasks-cli move TASK-ID STATUS [--strategy error|replace|merge]")
+		return fmt.Errorf("usage: tasks-cli move TASK-ID STATUS [--path EXACT-PATH] [--strategy error|replace|merge]")
 	}
 	targetStatus, err := normalizeStatus(fs.Args()[1])
 	if err != nil {
 		return err
 	}
 	return withLock(store.config.TasksRoot, func() error {
-		task, err := store.find(fs.Args()[0])
+		task, err := store.findAtPath(fs.Args()[0], *path)
 		if err != nil {
 			return err
 		}

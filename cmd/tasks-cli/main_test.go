@@ -271,6 +271,62 @@ func TestDeleteRequiresMatchingConfirm(t *testing.T) {
 	}
 }
 
+func TestGetExactPathDisambiguatesDuplicateIDs(t *testing.T) {
+	tasks := sandboxRun(t)
+	if err := tasks("create", "--title", "First copy", "--prefix", "OP"); err != nil {
+		t.Fatal(err)
+	}
+	root := os.Getenv("TASKS_ROOT")
+	first := filepath.Join(root, "backlog", "OP-001-first-copy.md")
+	second := filepath.Join(root, "blocked", "OP-001-second-copy.md")
+	if err := os.MkdirAll(filepath.Dir(second), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(second, []byte("---\ntask: OP-001\nstatus: blocked\ntitle: Second copy\n---\n\nsecond body\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks("get", "OP-001"); err == nil {
+		t.Fatal("duplicate ID without --path must remain ambiguous")
+	}
+	if err := tasks("get", "OP-001", "--path", first); err != nil {
+		t.Fatalf("get first exact path: %v", err)
+	}
+	if err := tasks("get", "OP-001", "--path", second); err != nil {
+		t.Fatalf("get second exact path: %v", err)
+	}
+	if err := tasks("get", "OP-001", "--path", filepath.Join(root, "backlog", "missing.md")); err == nil {
+		t.Fatal("unknown exact path must fail")
+	}
+}
+
+func TestMoveExactPathDisambiguatesDuplicateIDs(t *testing.T) {
+	tasks := sandboxRun(t)
+	if err := tasks("create", "--title", "First copy", "--prefix", "OP"); err != nil {
+		t.Fatal(err)
+	}
+	root := os.Getenv("TASKS_ROOT")
+	first := filepath.Join(root, "backlog", "OP-001-first-copy.md")
+	second := filepath.Join(root, "blocked", "OP-001-second-copy.md")
+	if err := os.MkdirAll(filepath.Dir(second), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(second, []byte("---\ntask: OP-001\nstatus: blocked\ntitle: Second copy\n---\n\nsecond body\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks("move", "OP-001", "done"); err == nil {
+		t.Fatal("duplicate ID without --path must remain ambiguous")
+	}
+	if err := tasks("move", "OP-001", "done", "--path", first); err != nil {
+		t.Fatalf("move first exact path: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "done", filepath.Base(first))); err != nil {
+		t.Fatalf("moved first copy: %v", err)
+	}
+	if _, err := os.Stat(second); err != nil {
+		t.Fatalf("unrelated duplicate changed: %v", err)
+	}
+}
+
 func TestAttachCopiesFileIntoCompanionDir(t *testing.T) {
 	tasks := sandboxRun(t)
 	if err := tasks("create", "--title", "Needs evidence", "--prefix", "OP"); err != nil {
