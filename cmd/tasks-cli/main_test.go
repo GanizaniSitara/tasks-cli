@@ -4,6 +4,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -327,6 +328,71 @@ func TestMoveExactPathDisambiguatesDuplicateIDs(t *testing.T) {
 	}
 }
 
+func TestDedupeRenumbersNewerFile(t *testing.T) {
+	tasks := sandboxRun(t)
+	if err := tasks("create", "--title", "Original ticket", "--prefix", "OP"); err != nil {
+		t.Fatal(err)
+	}
+	root := os.Getenv("TASKS_ROOT")
+	original := filepath.Join(root, "backlog", "OP-001-original-ticket.md")
+	// A second writer (the feedback path on the other replication host) minted
+	// the same id with a later created date.
+	usurper := filepath.Join(root, "done", "OP-001-usurper-ticket.md")
+	if err := os.MkdirAll(filepath.Dir(usurper), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(usurper, []byte("---\ntask: OP-001\nstatus: done\ntitle: Usurper\ncreated: \"2099-01-01\"\n---\n\nusurper body\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// Legacy numeric pair: filename 010 carrying frontmatter id 8.
+	legacyKeeper := filepath.Join(root, "done", "008-legacy-keeper.md")
+	legacyLoser := filepath.Join(root, "done", "010-legacy-loser.md")
+	for path, id := range map[string]string{legacyKeeper: "8", legacyLoser: "8"} {
+		if err := os.WriteFile(path, []byte("---\ntask: "+id+"\nstatus: done\ntitle: Legacy\n---\n\nbody\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	// Dry run changes nothing.
+	if err := tasks("dedupe"); err != nil {
+		t.Fatalf("dedupe dry run: %v", err)
+	}
+	if _, err := os.Stat(usurper); err != nil {
+		t.Fatalf("dry run must not rename: %v", err)
+	}
+
+	if err := tasks("dedupe", "--apply"); err != nil {
+		t.Fatalf("dedupe apply: %v", err)
+	}
+	// The original keeps its id; the usurper is renumbered to the next free OP number.
+	if _, err := os.Stat(original); err != nil {
+		t.Fatalf("keeper renamed: %v", err)
+	}
+	renumbered := filepath.Join(root, "done", "OP-002-usurper-ticket.md")
+	raw, err := os.ReadFile(renumbered)
+	if err != nil {
+		t.Fatalf("renumbered usurper missing: %v", err)
+	}
+	if !strings.Contains(string(raw), "task: OP-002") {
+		t.Errorf("usurper frontmatter not renumbered: %s", raw)
+	}
+	if !strings.Contains(string(raw), "Renumbered from OP-001") {
+		t.Errorf("no provenance note: %s", raw)
+	}
+	// The legacy loser reclaims the number its own filename always claimed.
+	rawLegacy, err := os.ReadFile(legacyLoser)
+	if err != nil {
+		t.Fatalf("legacy loser moved unexpectedly: %v", err)
+	}
+	if !strings.Contains(string(rawLegacy), "task: \"10\"") && !strings.Contains(string(rawLegacy), "task: 10") {
+		t.Errorf("legacy loser should carry id 10: %s", rawLegacy)
+	}
+	// And the corpus reports clean.
+	if err := tasks("dedupe"); err != nil {
+		t.Fatalf("dedupe recheck: %v", err)
+	}
+}
+
 func TestAttachCopiesFileIntoCompanionDir(t *testing.T) {
 	tasks := sandboxRun(t)
 	if err := tasks("create", "--title", "Needs evidence", "--prefix", "OP"); err != nil {
@@ -484,8 +550,8 @@ func TestMigrateIsDryRunByDefault(t *testing.T) {
 func TestCommandHelpCoversEveryCommand(t *testing.T) {
 	commands := []string{
 		"summary", "projects", "search", "get", "create", "update", "move",
-		"reopen", "delete", "duplicates", "note", "attach", "asset", "lint", "pivot",
-		"repair", "migrate", "index",
+		"reopen", "delete", "duplicates", "dedupe", "note", "attach", "asset",
+		"lint", "pivot", "repair", "migrate", "index",
 	}
 	for _, command := range commands {
 		if _, ok := commandHelp[command]; !ok {

@@ -165,6 +165,8 @@ func run(args []string) error {
 		return commandDelete(store, index, args[1:])
 	case "duplicates":
 		return commandDuplicates(store)
+	case "dedupe":
+		return commandDedupe(store, index, args[1:])
 	case "note":
 		return commandNote(store, index, args[1:])
 	case "attach":
@@ -191,7 +193,7 @@ func printHelp() {
 
 Commands:
   summary | projects | search | get | create | update | move | reopen | delete
-  duplicates | note | attach | lint | pivot | repair | migrate
+  duplicates | dedupe | note | attach | lint | pivot | repair | migrate
   index sync | index rebuild
 
 All successful commands emit JSON. Markdown files remain the source of truth.
@@ -240,6 +242,13 @@ Allowed project prefixes from the configured allowlist. No flags.`,
 	"duplicates": `tasks-cli duplicates
 
 Task IDs that appear in more than one file. No flags.`,
+
+	"dedupe": `tasks-cli dedupe [--apply]
+
+Resolve duplicate task IDs by renumbering the newer file of each colliding
+pair to the next free number in its prefix. The file whose filename agrees
+with its frontmatter id keeps the id; otherwise the earlier created date
+wins. Dry run unless --apply. Renumbered tickets get a provenance note.`,
 
 	"lint": `tasks-cli lint
 
@@ -1879,6 +1888,209 @@ func commandDuplicates(store *Store) error {
 	}
 	emit(map[string]interface{}{"count": len(duplicates), "duplicates": duplicates})
 	return nil
+}
+
+// stemAgreesWithID reports whether a task file's name claims the same id as
+// its frontmatter. Disagreement marks the file whose frontmatter was minted
+// wrongly (e.g. a legacy done/010-some-note.md carrying `task: 8`).
+func stemAgreesWithID(task *Task) bool {
+	stemID, _ := splitStem(strings.TrimSuffix(filepath.Base(task.Path), filepath.Ext(task.Path)))
+	if strings.EqualFold(stemID, task.ID) {
+		return true
+	}
+	// Legacy numeric stems are zero-padded ("008") while ids are not ("8").
+	stemNum, stemErr := strconv.Atoi(stemID)
+	idNum, idErr := strconv.Atoi(task.ID)
+	return stemErr == nil && idErr == nil && stemNum == idNum
+}
+
+// dedupeKeeper picks which file of a colliding pair keeps the id: the one
+// whose filename agrees with its frontmatter, else the earlier created date,
+// else the earlier path — every tiebreak deterministic so repeated runs on
+// both replication hosts converge on the same answer.
+func dedupeKeeper(group []*Task) *Task {
+	sort.Slice(group, func(i, j int) bool {
+		iAgrees, jAgrees := stemAgreesWithID(group[i]), stemAgreesWithID(group[j])
+		if iAgrees != jAgrees {
+			return iAgrees
+		}
+		if group[i].Created != group[j].Created {
+			// Missing created sorts last, never first.
+			if group[i].Created == "" || group[j].Created == "" {
+				return group[j].Created == ""
+			}
+			return group[i].Created < group[j].Created
+		}
+		return group[i].Path < group[j].Path
+	})
+	return group[0]
+}
+
+func commandDedupe(store *Store, idx taskIndex, args []string) error {
+	fs := flag.NewFlagSet("dedupe", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	apply := fs.Bool("apply", false, "")
+	if err := parseInterspersed(fs, args); err != nil {
+		return err
+	}
+	if len(fs.Args()) != 0 {
+		return fmt.Errorf("usage: tasks-cli dedupe [--apply]")
+	}
+	return withLock(store.config.TasksRoot, func() error {
+		tasks, err := store.scanTasks()
+		if err != nil {
+			return err
+		}
+		byID := map[string][]*Task{}
+		taken := map[string]bool{}
+		maxByPrefix := map[string]int{}
+		for _, task := range tasks {
+			key := strings.ToUpper(task.ID)
+			byID[key] = append(byID[key], task)
+			taken[key] = true
+			prefix, number := parseID(task.ID)
+			if prefix == "" {
+				if n, err := strconv.Atoi(task.ID); err == nil {
+					number = n
+				}
+			}
+			if number > maxByPrefix[prefix] {
+				maxByPrefix[prefix] = number
+			}
+		}
+
+		mintID := func(prefix string, number int) string {
+			if prefix == "" {
+				return strconv.Itoa(number)
+			}
+			return canonicalTaskID(prefix, number)
+		}
+
+		var ids []string
+		for id, group := range byID {
+			if len(group) > 1 {
+				ids = append(ids, id)
+			}
+		}
+		sort.Strings(ids)
+
+		var resolutions []map[string]interface{}
+		for _, id := range ids {
+			group := byID[id]
+			keeper := dedupeKeeper(group)
+			for _, loser := range group {
+				if loser == keeper {
+					continue
+				}
+				prefix, _ := parseID(loser.ID)
+				// Prefer the number the loser's own filename claims (the
+				// legacy "010 carrying task: 8" case) when that id is free.
+				newID := ""
+				stemID, _ := splitStem(strings.TrimSuffix(filepath.Base(loser.Path), filepath.Ext(loser.Path)))
+				if !strings.EqualFold(stemID, loser.ID) {
+					candidate := stemID
+					if n, err := strconv.Atoi(stemID); err == nil && prefix == "" {
+						candidate = strconv.Itoa(n)
+					}
+					if candidate != "" && !taken[strings.ToUpper(candidate)] {
+						cp, cn := parseID(candidate)
+						if strings.EqualFold(cp, prefix) || (prefix == "" && cp == "") {
+							newID = candidate
+							if cn > maxByPrefix[prefix] {
+								maxByPrefix[prefix] = cn
+							}
+						}
+					}
+				}
+				if newID == "" {
+					maxByPrefix[prefix]++
+					newID = mintID(prefix, maxByPrefix[prefix])
+				}
+				taken[strings.ToUpper(newID)] = true
+
+				newPath := loser.Path
+				if !stemAgreesWithIDValue(loser.Path, newID) {
+					_, slug := splitStem(strings.TrimSuffix(filepath.Base(loser.Path), filepath.Ext(loser.Path)))
+					name := newID
+					if slug != "" {
+						name += "-" + slug
+					}
+					newPath = filepath.Join(filepath.Dir(loser.Path), name+".md")
+				}
+				resolutions = append(resolutions, map[string]interface{}{
+					"id":       id,
+					"kept":     keeper.Path,
+					"loser":    loser.Path,
+					"new_id":   newID,
+					"new_path": newPath,
+				})
+				if *apply {
+					if err := renumberTask(store, loser, newID, newPath); err != nil {
+						return err
+					}
+				}
+			}
+		}
+
+		result := map[string]interface{}{
+			"dry_run":     !*apply,
+			"count":       len(resolutions),
+			"resolutions": resolutions,
+		}
+		if *apply && len(resolutions) > 0 {
+			sync, err := idx.sync(store)
+			if err != nil {
+				return err
+			}
+			result["sync"] = sync
+		}
+		emit(result)
+		return nil
+	})
+}
+
+// stemAgreesWithIDValue is stemAgreesWithID against a prospective id rather
+// than the task's current one, so an already-correct filename is not renamed.
+func stemAgreesWithIDValue(path, id string) bool {
+	stemID, _ := splitStem(strings.TrimSuffix(filepath.Base(path), filepath.Ext(path)))
+	if strings.EqualFold(stemID, id) {
+		return true
+	}
+	stemNum, stemErr := strconv.Atoi(stemID)
+	idNum, idErr := strconv.Atoi(id)
+	return stemErr == nil && idErr == nil && stemNum == idNum
+}
+
+func renumberTask(store *Store, task *Task, newID, newPath string) error {
+	oldID := task.ID
+	if newPath != task.Path {
+		if _, err := os.Stat(newPath); err == nil {
+			return fmt.Errorf("renumber target already exists: %s", newPath)
+		}
+		if err := os.Rename(task.Path, newPath); err != nil {
+			return err
+		}
+		oldCompanion := strings.TrimSuffix(task.Path, filepath.Ext(task.Path))
+		newCompanion := strings.TrimSuffix(newPath, filepath.Ext(newPath))
+		if _, err := os.Stat(oldCompanion); err == nil {
+			if err := os.Rename(oldCompanion, newCompanion); err != nil {
+				return err
+			}
+		}
+		task.Path = newPath
+		task.CompanionDir = companionIfExists(strings.TrimSuffix(newPath, filepath.Ext(newPath)))
+	}
+	task.ID = newID
+	task.Prefix, task.Number = parseID(newID)
+	if task.Prefix == "" {
+		if n, err := strconv.Atoi(newID); err == nil {
+			task.Number = n
+		}
+	}
+	task.Body = appendHeading(task.Body, "Notes",
+		time.Now().Format("2006-01-02 15:04")+" — Renumbered from "+oldID+" (duplicate id) by tasks-cli dedupe.")
+	task.Updated = time.Now().Format("2006-01-02")
+	return store.writeTask(task)
 }
 
 func appendHeading(body, heading, note string) string {
