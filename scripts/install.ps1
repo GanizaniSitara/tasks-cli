@@ -35,7 +35,21 @@ try {
 
     $destDir = Split-Path -Parent $Destination
     if (-not (Test-Path -LiteralPath $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
-    Move-Item -LiteralPath $staging -Destination $Destination -Force
+
+    # Move-Item -Force does not reliably clobber an existing destination on
+    # Windows PowerShell -- it can still fail with "file already exists". Remove
+    # first, and retry: the old binary may be momentarily held by a scheduled
+    # sync tick or an agent shelling out to it.
+    for ($attempt = 1; ; $attempt++) {
+        try {
+            if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Force }
+            Move-Item -LiteralPath $staging -Destination $Destination
+            break
+        } catch {
+            if ($attempt -ge 5) { throw "could not install to ${Destination}: $($_.Exception.Message)" }
+            Start-Sleep -Seconds 1
+        }
+    }
 
     Write-Host "installed $commit -> $Destination"
     & $Destination version
