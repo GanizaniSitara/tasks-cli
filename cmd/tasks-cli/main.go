@@ -23,6 +23,15 @@ import (
 	"go.yaml.in/yaml/v3"
 )
 
+// Stamped by scripts/install.* via -ldflags. Each host builds its own binary
+// from the one shared source, so the only way to notice that a host has fallen
+// behind is to ask the binary which commit it came from -- and which file on
+// disk answered, when more than one copy exists.
+var (
+	buildCommit = "unknown"
+	buildTime   = "unknown"
+)
+
 var statuses = []string{"backlog", "in-progress", "blocked", "done"}
 
 var statusAliases = map[string]string{
@@ -137,6 +146,16 @@ func run(args []string) error {
 	if len(args) > 1 && (args[1] == "--help" || args[1] == "-h") {
 		return printCommandHelp(args[0])
 	}
+	// Answered before the store is opened, so a binary can be identified on a
+	// machine with no readable config -- the same reason help works there.
+	if args[0] == "version" || args[0] == "--version" {
+		binary, err := os.Executable()
+		if err != nil {
+			binary = "unknown"
+		}
+		emit(map[string]interface{}{"commit": buildCommit, "built": buildTime, "binary": binary, "go": runtime.Version(), "platform": runtime.GOOS + "/" + runtime.GOARCH})
+		return nil
+	}
 	store, err := newStore()
 	if err != nil {
 		return err
@@ -194,7 +213,7 @@ func printHelp() {
 Commands:
   summary | projects | search | get | create | update | move | reopen | delete
   duplicates | dedupe | note | attach | lint | pivot | repair | migrate
-  index sync | index rebuild
+  index sync | index rebuild | version
 
 All successful commands emit JSON. Markdown files remain the source of truth.
 Flags may appear before or after positional arguments.
@@ -242,6 +261,13 @@ Allowed project prefixes from the configured allowlist. No flags.`,
 	"duplicates": `tasks-cli duplicates
 
 Task IDs that appear in more than one file. No flags.`,
+
+	"version": `tasks-cli version
+
+The commit this binary was built from, when, and the file on disk that
+answered. Each host builds its own binary from the shared source, so compare
+this across hosts to catch one that has fallen behind. No flags; works
+without a readable config.`,
 
 	"dedupe": `tasks-cli dedupe [--apply]
 
@@ -1545,10 +1571,20 @@ func commandCreate(store *Store, idx taskIndex, args []string) error {
 			return err
 		}
 		next := 1
-		for _, task := range tasks {
-			if strings.EqualFold(task.Prefix, chosenPrefix) && task.Number >= next {
-				next = task.Number + 1
+		claim := func(prefix string, number int) {
+			if strings.EqualFold(prefix, chosenPrefix) && number >= next {
+				next = number + 1
 			}
+		}
+		for _, task := range tasks {
+			claim(task.Prefix, task.Number)
+			// A file whose frontmatter disagrees with its filename still owns
+			// the number its name claims. Allocating from the frontmatter alone
+			// hands that number out again and the two files collide by name in
+			// different status directories -- invisible to `duplicates`, since
+			// their ids differ.
+			stemID, _ := splitStem(strings.TrimSuffix(filepath.Base(task.Path), filepath.Ext(task.Path)))
+			claim(parseID(stemID))
 		}
 		id := canonicalTaskID(chosenPrefix, next)
 		slug := slugify(*title)

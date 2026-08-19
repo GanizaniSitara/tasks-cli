@@ -14,7 +14,7 @@ The command prints JSON so coding agents can use it safely from a shell.
 
 ## Commands
 
-`summary`, `projects`, `search`, `get`, `create`, `update`, `move`, `reopen`, `delete`, `duplicates`, `note`, `attach`, `asset add|update|remove|list`, `lint`, `pivot`, `repair`, `migrate`, and `index sync|rebuild`.
+`summary`, `projects`, `search`, `get`, `create`, `update`, `move`, `reopen`, `delete`, `duplicates`, `dedupe`, `note`, `attach`, `asset add|update|remove|list`, `lint`, `pivot`, `repair`, `migrate`, and `index sync|rebuild`.
 
 Tickets and their companion assets each get a full set of verbs: `create`/`update`
 for the ticket body, `asset add`/`asset update`/`asset remove` for the files beside
@@ -31,20 +31,33 @@ this works without a readable config, so it is safe to probe on a fresh machine.
 There is no `list` command: `tasks-cli search` with no query lists tasks from disk,
 so `tasks-cli search --status in-progress` is the way to enumerate a status.
 
-## Build and use
+## Install
+
+Each host builds its own binary from this one source. Install through the
+scripts so every host puts it in the same place and stamps it with the commit
+it came from; a hand-built copy left beside the source is on nobody's PATH,
+easy to run by accident, and ages silently.
 
 ```powershell
-go build -o tasks-cli.exe .\cmd\tasks-cli
-.\tasks-cli.exe index rebuild
-.\tasks-cli.exe search "wine scraper" --limit 5
-.\tasks-cli.exe move PROJ-092 done
-.\tasks-cli.exe note PROJ-092 --note "Verified before closing."
+.\scripts\install.ps1              # tests, builds, installs to C:\Tools\tasks-cli.exe
 ```
 
 ```sh
-go build -o tasks-cli ./cmd/tasks-cli
-./tasks-cli index rebuild
-./tasks-cli search "wine scraper" --limit 5
+./scripts/install.sh               # tests, builds, installs to ~/.local/bin/tasks-cli
+```
+
+Both take an alternative destination as their first argument, and both finish
+by printing `tasks-cli version`. Compare that across hosts to spot one that has
+fallen behind: it reports the commit, the build time, and the file on disk that
+answered.
+
+## Use
+
+```powershell
+tasks-cli index rebuild
+tasks-cli search "wine scraper" --limit 5
+tasks-cli move PROJ-092 done
+tasks-cli note PROJ-092 --note "Verified before closing."
 ```
 
 Flags may appear before or after positional arguments. Repeat `--tag` for
