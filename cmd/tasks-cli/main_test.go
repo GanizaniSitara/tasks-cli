@@ -224,6 +224,32 @@ func TestCreateAllocatesSequentialIDs(t *testing.T) {
 	}
 }
 
+// A file whose frontmatter id disagrees with its filename still owns the
+// number its name claims. Allocating from the frontmatter alone hands that
+// number out again, producing two files with the same name in different status
+// directories -- a collision `duplicates` cannot see, because the two ids
+// differ.
+func TestCreateSkipsNumbersClaimedByFilenames(t *testing.T) {
+	tasks := sandboxRun(t)
+	root := os.Getenv("TASKS_ROOT")
+	if err := os.MkdirAll(filepath.Join(root, "done"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	mismatched := filepath.Join(root, "done", "OP-003-mismatched.md")
+	if err := os.WriteFile(mismatched, []byte("---\ntask: OP-002\nstatus: done\ntitle: Mismatched\n---\n\nbody\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks("create", "--title", "New ticket", "--prefix", "OP"); err != nil {
+		t.Fatal(err)
+	}
+	if matches, _ := filepath.Glob(filepath.Join(root, "*", "OP-003-*.md")); len(matches) != 1 {
+		t.Errorf("OP-003 claimed twice: %v", matches)
+	}
+	if _, err := os.Stat(filepath.Join(root, "backlog", "OP-004-new-ticket.md")); err != nil {
+		t.Errorf("expected the new ticket at OP-004: %v", err)
+	}
+}
+
 func TestCreateRejectsUnapprovedPrefixAndMissingTitle(t *testing.T) {
 	tasks := sandboxRun(t)
 	if err := tasks("create", "--title", "Nope", "--prefix", "ZZZ"); err == nil {
@@ -551,7 +577,7 @@ func TestCommandHelpCoversEveryCommand(t *testing.T) {
 	commands := []string{
 		"summary", "projects", "search", "get", "create", "update", "move",
 		"reopen", "delete", "duplicates", "dedupe", "note", "attach", "asset",
-		"lint", "pivot", "repair", "migrate", "index",
+		"lint", "pivot", "repair", "migrate", "index", "version",
 	}
 	for _, command := range commands {
 		if _, ok := commandHelp[command]; !ok {
@@ -571,7 +597,9 @@ func TestHelpRequestParsing(t *testing.T) {
 	t.Setenv("TASKS_CONFIG", filepath.Join(sandbox, "does-not-exist.yaml"))
 	t.Setenv("TASKS_ROOT", filepath.Join(sandbox, "tasks"))
 	t.Setenv("TASKS_INDEX_DIR", filepath.Join(sandbox, "bleve"))
-	for _, args := range [][]string{{"help"}, {"--help"}, {"-h"}, {"create", "--help"}, {"help", "create"}, {"index", "-h"}} {
+	// version answers before the store opens, for the same reason help does:
+	// identifying a binary must work on a machine whose config is missing.
+	for _, args := range [][]string{{"help"}, {"--help"}, {"-h"}, {"create", "--help"}, {"help", "create"}, {"index", "-h"}, {"version"}, {"--version"}} {
 		if err := run(args); err != nil {
 			t.Errorf("run(%v) = %v, want nil", args, err)
 		}
