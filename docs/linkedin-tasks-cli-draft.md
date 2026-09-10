@@ -2,7 +2,7 @@
 
 I used to be a big Jira user. For my own work, it has now quietly been replaced by something much smaller.
 
-I first built an MCP server so Claude, Codex and Copilot could share one backlog. Then the local architecture changed twice: the agents moved to a Go command-line tool, and the last GUI integration moved from the old HTTP/MCP route to invoking that same CLI.
+I first built an MCP server so Claude, Codex and Copilot could share one backlog. A GUI later used two plain HTTP routes beside that server. Then the local architecture changed again: the agents moved to a Go command-line tool, and the GUI's API adapter moved to invoking that same CLI.
 
 The data stayed the same. Markdown files are the source of truth, the search index is disposable, and every command returns JSON an agent or a human can inspect. The interface changed. A local agent already has a shell; a GUI can call a thin adapter that shells out to the same binary. There is no second task implementation to drift.
 
