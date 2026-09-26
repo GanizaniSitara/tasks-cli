@@ -75,6 +75,10 @@ type Task struct {
 	Priority     string                 `json:"priority,omitempty"`
 	Created      string                 `json:"created,omitempty"`
 	Updated      string                 `json:"updated,omitempty"`
+	DeferUntil   string                 `json:"defer_until,omitempty"`
+	DeclineUntil string                 `json:"declined_until,omitempty"`
+	WaitingOn    string                 `json:"waiting_on,omitempty"`
+	Contexts     []string               `json:"context,omitempty"`
 	Tags         []string               `json:"tags"`
 	Path         string                 `json:"path"`
 	CompanionDir string                 `json:"companion_dir,omitempty"`
@@ -170,6 +174,14 @@ func run(args []string) error {
 		return nil
 	case "search":
 		return commandSearch(store, index, args[1:])
+	case "next":
+		return commandNext(store, args[1:])
+	case "defer":
+		return commandDefer(store, index, args[1:])
+	case "decline":
+		return commandDecline(store, index, args[1:])
+	case "backfill":
+		return commandBackfill(store, index, args[1:])
 	case "get":
 		return commandGet(store, args[1:])
 	case "create":
@@ -211,9 +223,12 @@ func printHelp() {
 	fmt.Println(`tasks-cli <command> [flags]
 
 Commands:
-  summary | projects | search | get | create | update | move | reopen | delete
-  duplicates | dedupe | note | attach | lint | pivot | repair | migrate
-  index sync | index rebuild | version
+  summary | projects | search | next | get | create | update | move | reopen
+  delete | defer | decline | duplicates | dedupe | note | attach | lint | pivot
+  repair | migrate | backfill | index sync | index rebuild | version
+
+"next" is the one to ask for work: it applies defer_until, declined_until,
+waiting_on and context, so it answers what is actionable rather than what exists.
 
 All successful commands emit JSON. Markdown files remain the source of truth.
 Flags may appear before or after positional arguments.
@@ -281,16 +296,76 @@ wins. Dry run unless --apply. Renumbered tickets get a provenance note.`,
 Corpus integrity report: duplicate IDs, missing prefixes, orphan companion
 directories, non-normalized priorities, and status mismatches. No flags.`,
 
+	"next": `tasks-cli next [flags]
+
+What is actionable right now, as opposed to what exists. Covers backlog and
+in-progress, drops anything deferred, declined, waiting on someone else, or
+belonging to a context you are not in, then ranks by priority and breaks ties
+by staleness so the head of the list rotates.
+
+  --context LIST       where you are, comma-separated (desktop, terminal, mac, ...)
+  --priority LIST      comma-separated priorities to include, e.g. P1,P2
+  --prefix PREFIX      restrict to one project prefix
+  --project PROJECT    restrict to one project field
+  --limit N            maximum results (default 10)
+  --warm               freshest first instead of stalest first
+  --include-deferred   ignore defer_until and declined_until
+  --include-waiting    ignore waiting_on
+  --all                both of the above
+
+A task with no context declared matches every context: unlabelled work could be
+doable anywhere, so it is shown rather than lost. The "suppressed" counts in the
+output say how many were hidden and why, so an empty list is never ambiguous.`,
+
+	"defer": `tasks-cli defer TASK-ID --until YYYY-MM-DD | --for 14d [flags]
+
+Hide a task until a date, then let it return by itself. This is the durable
+replacement for parking something in blocked and setting an external reminder.
+
+  --until YYYY-MM-DD   explicit wake date
+  --for 14d            relative: d, w, m (14d, 2w, 1m)
+  --because TEXT       reason, appended to the ticket as a timestamped note
+  --clear              wake it now
+
+Defer requires a horizon: one of --until or --for. The reason is written into
+the body, not just the frontmatter, so the why outlives the session.`,
+
+	"decline": `tasks-cli decline TASK-ID [--for 14d] [flags]
+
+Record "not this one" so the next "what's next" stops offering it. Same
+mechanism as defer against a separate field, because the distinction matters:
+defer is not yet, decline is not this.
+
+  --for 14d            how long the rejection sticks (default 14d)
+  --until YYYY-MM-DD    explicit date instead
+  --because TEXT       reason, appended to the ticket as a timestamped note
+  --clear              offer it again immediately`,
+
+	"backfill": `tasks-cli backfill [--mac-prefix CSF --mac-prefix GOL] [--apply]
+
+Turn existing conventions into context data: titles containing "(AT WORK)"
+become context: terminal, and any prefix named with --mac-prefix becomes
+context: mac. Skips done tasks and anything that already declares a context.
+Dry run unless --apply, like repair and migrate.
+
+Worth doing once, because filters that live as prose in an agent's system
+prompt are the ones that get forgotten.`,
+
 	"search": `tasks-cli search [QUERY] [flags]
 
 Search the Bleve index. With no QUERY, lists tasks from disk instead, which is
 how you enumerate a status (there is no separate "list" command).
 
-  --status STATUS      backlog | in-progress | blocked | done
+  --status LIST        backlog | in-progress | blocked | done (comma-separated)
+  --priority LIST      comma-separated priorities to include, e.g. P1,P2
   --prefix PREFIX      restrict to one project prefix, e.g. PROJ
   --project PROJECT    restrict to one project field
   --limit N            maximum results (default 20)
+  --brief              emit id, title, priority, status, project, updated only
   --include-content    include companion-file text in each result
+
+Enumeration (no QUERY) is ordered by priority then task id, so --brief is the
+way to rank a working set without reading every field of every task.
 
 Every term must match, though each may match in any field (id, title, tags,
 body). If nothing matches all of them the search retries with any-term
@@ -302,7 +377,8 @@ sync.matched:
                  candidates and check each one before relying on it
 
   tasks-cli search "wine scraper" --limit 5
-  tasks-cli search --status in-progress --prefix PROJ`,
+  tasks-cli search --status in-progress --prefix PROJ
+  tasks-cli search --status backlog,in-progress,blocked --brief --limit 200`,
 
 	"get": `tasks-cli get TASK-ID [--path EXACT-PATH]
 
@@ -340,6 +416,9 @@ title does not rename the file; run "tasks-cli migrate" to reconcile file stems.
   --status STATUS          moves the file if the status changes
   --tag TAG                repeat the flag for multiple tags
   --clear-tags             drop all existing tags
+  --waiting-on WHO         who the ball is with; "me" or empty clears it
+  --context WHERE          repeat or comma-separate (desktop, terminal, mac, ...)
+  --clear-context          drop all declared contexts
 
   tasks-cli update PROJ-092 --priority P1 --tag go`,
 
@@ -702,6 +781,8 @@ func (s *Store) parseTaskWithAssets(path, status string, includeAssetContent boo
 	return &Task{
 		ID: id, Prefix: prefix, Project: project, Number: number, Title: title, Status: status,
 		Priority: stringValue(meta["priority"]), Created: stringValue(meta["created"]), Updated: stringValue(meta["updated"]),
+		DeferUntil: stringValue(meta["defer_until"]), DeclineUntil: stringValue(meta["declined_until"]),
+		WaitingOn: stringValue(meta["waiting_on"]), Contexts: normalizeTags(meta["context"]),
 		Tags: tags, Path: path, CompanionDir: companionIfExists(companion), Frontmatter: meta, AssetPaths: assetPaths,
 		Body: body, AssetBlob: assetBlob, Slug: slug, Signature: signature,
 	}, nil
@@ -1026,6 +1107,22 @@ func (s *Store) writeTask(task *Task) error {
 		task.Frontmatter["tags"] = task.Tags
 	} else {
 		delete(task.Frontmatter, "tags")
+	}
+	// Scheduling fields are absent rather than empty when unset, so a task that
+	// was never deferred looks exactly as it did before this feature existed.
+	for key, value := range map[string]string{
+		"defer_until": task.DeferUntil, "declined_until": task.DeclineUntil, "waiting_on": task.WaitingOn,
+	} {
+		if value != "" {
+			task.Frontmatter[key] = value
+		} else {
+			delete(task.Frontmatter, key)
+		}
+	}
+	if len(task.Contexts) > 0 {
+		task.Frontmatter["context"] = task.Contexts
+	} else {
+		delete(task.Frontmatter, "context")
 	}
 	encoded, err := yaml.Marshal(task.Frontmatter)
 	if err != nil {
@@ -1421,10 +1518,12 @@ func commandSearch(store *Store, idx taskIndex, args []string) error {
 	fs := flag.NewFlagSet("search", flag.ContinueOnError)
 	fs.SetOutput(io.Discard)
 	status := fs.String("status", "", "")
+	priority := fs.String("priority", "", "")
 	prefix := fs.String("prefix", "", "")
 	project := fs.String("project", "", "")
 	limit := fs.Int("limit", 20, "")
 	include := fs.Bool("include-content", false, "")
+	brief := fs.Bool("brief", false, "")
 	if err := parseInterspersed(fs, args); err != nil {
 		return err
 	}
@@ -1432,12 +1531,25 @@ func commandSearch(store *Store, idx taskIndex, args []string) error {
 	if *limit < 1 {
 		return fmt.Errorf("limit must be positive")
 	}
-	if *status != "" {
-		var err error
-		*status, err = normalizeStatus(*status)
-		if err != nil {
-			return err
+	statuses, err := normalizeStatusList(*status)
+	if err != nil {
+		return err
+	}
+	priorities := prioritySet(*priority)
+	// The Bleve path filters on a single status; a multi-status query is
+	// narrowed after the fact instead.
+	indexStatus := ""
+	if len(statuses) == 1 {
+		indexStatus = statuses[0]
+	}
+	keep := func(task *Task) bool {
+		if len(statuses) > 0 && !containsString(statuses, task.Status) {
+			return false
 		}
+		if len(priorities) > 0 && !priorities[canonicalPriority(task.Priority)] {
+			return false
+		}
+		return true
 	}
 	if query == "" {
 		tasks, err := store.scanTasks()
@@ -1446,30 +1558,433 @@ func commandSearch(store *Store, idx taskIndex, args []string) error {
 		}
 		var filtered []*Task
 		for _, task := range tasks {
-			if (*status == "" || task.Status == *status) && (*prefix == "" || strings.EqualFold(task.Prefix, *prefix)) && (*project == "" || strings.EqualFold(task.Project, *project)) {
+			if keep(task) && (*prefix == "" || strings.EqualFold(task.Prefix, *prefix)) && (*project == "" || strings.EqualFold(task.Project, *project)) {
 				filtered = append(filtered, task)
 			}
 		}
 		sort.Slice(filtered, func(i, j int) bool {
-			return filtered[i].Updated+filtered[i].Created > filtered[j].Updated+filtered[j].Created
+			left, right := priorityRank(filtered[i].Priority), priorityRank(filtered[j].Priority)
+			if left != right {
+				return left < right
+			}
+			return filtered[i].ID < filtered[j].ID
 		})
 		if len(filtered) > *limit {
 			filtered = filtered[:*limit]
 		}
-		emitSearch(query, *status, *prefix, *project, "filesystem", filtered, *include, nil)
+		emitSearch(query, *status, *prefix, *project, "filesystem", filtered, *include, *brief, nil)
 		return nil
 	}
-	tasks, sync, err := idx.search(store, query, *status, strings.ToUpper(*prefix), strings.ToUpper(*project), *limit, *include)
+	// Post-filtering can only remove hits, so ask the index for more than the
+	// caller wants whenever a filter still has to be applied afterwards.
+	indexLimit := *limit
+	if len(priorities) > 0 || len(statuses) > 1 {
+		indexLimit = *limit * 8
+		if indexLimit > 1000 {
+			indexLimit = 1000
+		}
+	}
+	hits, sync, err := idx.search(store, query, indexStatus, strings.ToUpper(*prefix), strings.ToUpper(*project), indexLimit, *include)
 	if err != nil {
 		return err
 	}
-	emitSearch(query, *status, *prefix, *project, "bleve", tasks, *include, sync)
+	tasks := make([]*Task, 0, len(hits))
+	for _, task := range hits {
+		if keep(task) {
+			tasks = append(tasks, task)
+		}
+		if len(tasks) >= *limit {
+			break
+		}
+	}
+	emitSearch(query, *status, *prefix, *project, "bleve", tasks, *include, *brief, sync)
 	return nil
 }
 
-func emitSearch(query, status, prefix, project, source string, tasks []*Task, include bool, sync map[string]interface{}) {
+// commandNext answers "what should I do now" rather than "what exists".
+//
+// `search` ranks by priority then task id and nothing else, so the same head
+// leads the list every day until its status changes -- rejections are replayed,
+// work that is waiting on somebody else looks identical to work that could be
+// started this minute, and tickets that can only be done elsewhere still appear.
+// This applies the four scheduling fields and rotates the tail by staleness.
+func commandNext(store *Store, args []string) error {
+	fs := flag.NewFlagSet("next", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	context := fs.String("context", "", "")
+	priority := fs.String("priority", "", "")
+	prefix := fs.String("prefix", "", "")
+	project := fs.String("project", "", "")
+	limit := fs.Int("limit", 10, "")
+	warm := fs.Bool("warm", false, "")
+	includeDeferred := fs.Bool("include-deferred", false, "")
+	includeWaiting := fs.Bool("include-waiting", false, "")
+	all := fs.Bool("all", false, "")
+	if err := parseInterspersed(fs, args); err != nil {
+		return err
+	}
+	if len(fs.Args()) > 0 {
+		return fmt.Errorf("next takes no positional arguments; use search for queries")
+	}
+	if *limit < 1 {
+		return fmt.Errorf("limit must be positive")
+	}
+	if *all {
+		*includeDeferred, *includeWaiting = true, true
+	}
+	wanted := map[string]bool{}
+	for _, piece := range strings.Split(*context, ",") {
+		if piece = strings.ToLower(strings.TrimSpace(piece)); piece != "" {
+			wanted[piece] = true
+		}
+	}
+	priorities := prioritySet(*priority)
+	now := today()
+
+	tasks, err := store.scanTasks()
+	if err != nil {
+		return err
+	}
+	suppressed := map[string]int{}
+	var ready []*Task
+	for _, task := range tasks {
+		if task.Status != "backlog" && task.Status != "in-progress" {
+			continue
+		}
+		if len(priorities) > 0 && !priorities[canonicalPriority(task.Priority)] {
+			continue
+		}
+		if *prefix != "" && !strings.EqualFold(task.Prefix, *prefix) {
+			continue
+		}
+		if *project != "" && !strings.EqualFold(task.Project, *project) {
+			continue
+		}
+		// Counted rather than silently dropped: a caller that sees "nothing to do"
+		// needs to know whether that means done or merely hidden.
+		if !*includeDeferred && pending(task.DeferUntil, now) {
+			suppressed["deferred"]++
+			continue
+		}
+		if !*includeDeferred && pending(task.DeclineUntil, now) {
+			suppressed["declined"]++
+			continue
+		}
+		if !*includeWaiting && waitingOnSomeoneElse(task.WaitingOn) {
+			suppressed["waiting"]++
+			continue
+		}
+		if !contextMatches(task.Contexts, wanted) {
+			suppressed["wrong_context"]++
+			continue
+		}
+		ready = append(ready, task)
+	}
+	sort.Slice(ready, func(i, j int) bool {
+		left, right := priorityRank(ready[i].Priority), priorityRank(ready[j].Priority)
+		if left != right {
+			return left < right
+		}
+		// Staleness breaks the tie, so the head of the list rotates instead of
+		// pinning whatever happens to sort first by id. An unstamped task counts
+		// as the stalest thing there is.
+		if ready[i].Updated != ready[j].Updated {
+			if *warm {
+				return ready[i].Updated > ready[j].Updated
+			}
+			return ready[i].Updated < ready[j].Updated
+		}
+		return ready[i].ID < ready[j].ID
+	})
+	total := len(ready)
+	if len(ready) > *limit {
+		ready = ready[:*limit]
+	}
+	results := make([]map[string]interface{}, 0, len(ready))
+	for _, task := range ready {
+		item := briefTaskMap(task)
+		item["context"] = nonNilStrings(task.Contexts)
+		item["waiting_on"] = emptyNil(task.WaitingOn)
+		results = append(results, item)
+	}
+	emit(map[string]interface{}{
+		"today": now, "context": emptyNil(*context), "results": results,
+		"ready_count": total, "shown": len(results), "suppressed": suppressed,
+	})
+	return nil
+}
+
+// commandDefer and commandDecline are the same mechanism pointed at different
+// fields, kept separate because the distinction is the point: defer records
+// "not yet", decline records "not this, don't offer it again for a while".
+func commandDefer(store *Store, idx taskIndex, args []string) error {
+	return scheduleTask(store, idx, args, "defer", "defer_until")
+}
+
+func commandDecline(store *Store, idx taskIndex, args []string) error {
+	return scheduleTask(store, idx, args, "decline", "declined_until")
+}
+
+func scheduleTask(store *Store, idx taskIndex, args []string, verb, field string) error {
+	fs := flag.NewFlagSet(verb, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	until := fs.String("until", "", "")
+	forSpan := fs.String("for", "", "")
+	because := fs.String("because", "", "")
+	clear := fs.Bool("clear", false, "")
+	if err := parseInterspersed(fs, args); err != nil {
+		return err
+	}
+	if len(fs.Args()) != 1 {
+		return fmt.Errorf("usage: tasks-cli %s TASK-ID [--until YYYY-MM-DD|--for 14d] [--because TEXT] [--clear]", verb)
+	}
+	if *until != "" && *forSpan != "" {
+		return fmt.Errorf("use one of --until or --for")
+	}
+	target := ""
+	if !*clear {
+		switch {
+		case *until != "":
+			if _, err := time.Parse("2006-01-02", *until); err != nil {
+				return fmt.Errorf("--until must be YYYY-MM-DD, got %q", *until)
+			}
+			target = *until
+		default:
+			span := *forSpan
+			if span == "" {
+				// A decline with no horizon is the common case and must not mean
+				// "forever"; defer always names its date.
+				if verb == "defer" {
+					return fmt.Errorf("defer needs --until YYYY-MM-DD or --for 14d")
+				}
+				span = "14d"
+			}
+			days, err := parseFor(span)
+			if err != nil {
+				return err
+			}
+			base, err := time.Parse("2006-01-02", today())
+			if err != nil {
+				return err
+			}
+			target = base.AddDate(0, 0, days).Format("2006-01-02")
+		}
+	}
+	return withLock(store.config.TasksRoot, func() error {
+		task, err := store.find(fs.Args()[0])
+		if err != nil {
+			return err
+		}
+		if field == "defer_until" {
+			task.DeferUntil = target
+		} else {
+			task.DeclineUntil = target
+		}
+		note := verb + "red until " + target
+		if *clear {
+			note = verb + " cleared"
+		}
+		if *because != "" {
+			note += " — " + strings.TrimSpace(*because)
+		}
+		// The reason goes in the body, not just the frontmatter date, so the why
+		// survives the session that decided it.
+		task.Body = appendHeading(task.Body, "Notes", time.Now().Format("2006-01-02 15:04")+" — "+note)
+		task.Updated = today()
+		if err := store.writeTask(task); err != nil {
+			return err
+		}
+		sync, err := idx.sync(store)
+		if err != nil {
+			return err
+		}
+		emit(map[string]interface{}{"task": taskMap(task, false), "sync": sync, field: emptyNil(target)})
+		return nil
+	})
+}
+
+// commandBackfill turns today's conventions into data. The filters that matter
+// are currently prose in an agent's system prompt ("CSF and GOL are Mac-only")
+// or a string inside a title ("(AT WORK)"), which is exactly why they get
+// forgotten. Dry run by default, like repair and migrate.
+func commandBackfill(store *Store, idx taskIndex, args []string) error {
+	fs := flag.NewFlagSet("backfill", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	apply := fs.Bool("apply", false, "")
+	var macPrefixes multiValue
+	fs.Var(&macPrefixes, "mac-prefix", "")
+	if err := parseInterspersed(fs, args); err != nil {
+		return err
+	}
+	mac := map[string]bool{}
+	for _, value := range splitTags(macPrefixes) {
+		mac[strings.ToUpper(value)] = true
+	}
+	return withLock(store.config.TasksRoot, func() error {
+		tasks, err := store.scanTasks()
+		if err != nil {
+			return err
+		}
+		actions := []map[string]interface{}{}
+		for _, task := range tasks {
+			if task.Status == "done" || len(task.Contexts) > 0 {
+				continue
+			}
+			var contexts []string
+			switch {
+			case mac[strings.ToUpper(task.Prefix)]:
+				contexts = []string{"mac"}
+			case strings.Contains(strings.ToUpper(task.Title), "(AT WORK)"):
+				contexts = []string{"terminal"}
+			default:
+				continue
+			}
+			actions = append(actions, map[string]interface{}{
+				"task_id": task.ID, "context": contexts, "title": task.Title,
+			})
+			if *apply {
+				task.Contexts = contexts
+				task.Updated = today()
+				if err := store.writeTask(task); err != nil {
+					return err
+				}
+			}
+		}
+		var sync map[string]interface{}
+		if *apply {
+			sync, err = idx.sync(store)
+			if err != nil {
+				return err
+			}
+		}
+		emit(map[string]interface{}{"applied": *apply, "actions": actions, "count": len(actions), "sync": sync})
+		return nil
+	})
+}
+
+// today is the clock seam. Every scheduling comparison goes through it so tests
+// can pin a date rather than depending on when they happen to run.
+var today = func() string { return time.Now().Format("2006-01-02") }
+
+// pending reports whether a YYYY-MM-DD field is still in the future. An unset or
+// unparseable date is NOT pending: a task is hidden only on a date we can read,
+// never because its frontmatter is malformed.
+func pending(value, now string) bool {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return false
+	}
+	if _, err := time.Parse("2006-01-02", value); err != nil {
+		return false
+	}
+	return value > now
+}
+
+// waitingOnSomeoneElse treats an unset owner as "me". The corpus predates this
+// field, so absence has to mean actionable or every existing task vanishes.
+func waitingOnSomeoneElse(value string) bool {
+	value = strings.ToLower(strings.TrimSpace(value))
+	return value != "" && value != "me" && value != "self"
+}
+
+// contextMatches is permissive about unlabelled work: a task with no context
+// could be doable anywhere, and hiding it would lose it. Only a task that
+// declares contexts and does not list this one is filtered out.
+func contextMatches(taskContexts []string, wanted map[string]bool) bool {
+	if len(wanted) == 0 || len(taskContexts) == 0 {
+		return true
+	}
+	for _, value := range taskContexts {
+		if wanted[strings.ToLower(strings.TrimSpace(value))] {
+			return true
+		}
+	}
+	return false
+}
+
+// parseFor accepts the short durations a deferral is actually expressed in.
+// time.ParseDuration tops out at hours, which makes "14d" an error there.
+func parseFor(value string) (int, error) {
+	value = strings.ToLower(strings.TrimSpace(value))
+	if value == "" {
+		return 0, fmt.Errorf("empty duration")
+	}
+	unit := value[len(value)-1]
+	multiplier := map[byte]int{'d': 1, 'w': 7, 'm': 30}[unit]
+	if multiplier == 0 {
+		return 0, fmt.Errorf("unknown duration %q; use days, weeks or months (14d, 2w, 1m)", value)
+	}
+	count, err := strconv.Atoi(value[:len(value)-1])
+	if err != nil || count < 1 {
+		return 0, fmt.Errorf("unknown duration %q; use days, weeks or months (14d, 2w, 1m)", value)
+	}
+	return count * multiplier, nil
+}
+
+func normalizeStatusList(value string) ([]string, error) {
+	var out []string
+	for _, piece := range strings.Split(value, ",") {
+		piece = strings.TrimSpace(piece)
+		if piece == "" {
+			continue
+		}
+		normalized, err := normalizeStatus(piece)
+		if err != nil {
+			return nil, err
+		}
+		if !containsString(out, normalized) {
+			out = append(out, normalized)
+		}
+	}
+	return out, nil
+}
+
+func prioritySet(value string) map[string]bool {
+	result := map[string]bool{}
+	for _, piece := range strings.Split(value, ",") {
+		if piece = strings.TrimSpace(piece); piece != "" {
+			result[canonicalPriority(piece)] = true
+		}
+	}
+	return result
+}
+
+func containsString(values []string, want string) bool {
+	for _, value := range values {
+		if value == want {
+			return true
+		}
+	}
+	return false
+}
+
+// priorityRank orders P0..P5 first and parks anything unset or unrecognised at
+// the end, so an unprioritised task never outranks a real one.
+func priorityRank(value string) int {
+	switch canonicalPriority(value) {
+	case "P0":
+		return 0
+	case "P1":
+		return 1
+	case "P2":
+		return 2
+	case "P3":
+		return 3
+	case "P4":
+		return 4
+	case "P5":
+		return 5
+	}
+	return 6
+}
+
+func emitSearch(query, status, prefix, project, source string, tasks []*Task, include, brief bool, sync map[string]interface{}) {
 	results := make([]map[string]interface{}, 0, len(tasks))
 	for _, task := range tasks {
+		if brief {
+			results = append(results, briefTaskMap(task))
+			continue
+		}
 		item := taskMap(task, include)
 		if query != "" {
 			item["snippet"] = snippet(task.Title+"\n"+task.Body+"\n"+task.AssetBlob, query)
@@ -1477,6 +1992,10 @@ func emitSearch(query, status, prefix, project, source string, tasks []*Task, in
 		results = append(results, item)
 	}
 	emit(map[string]interface{}{"query": query, "status": emptyNil(status), "prefix": emptyNil(prefix), "project": emptyNil(project), "source": source, "results": results, "sync": sync})
+}
+
+func briefTaskMap(task *Task) map[string]interface{} {
+	return map[string]interface{}{"task_id": task.ID, "title": task.Title, "priority": emptyNil(task.Priority), "status": task.Status, "project": emptyNil(task.Project), "updated": emptyNil(task.Updated)}
 }
 
 func snippet(content, query string) string {
@@ -1627,9 +2146,13 @@ func commandUpdate(store *Store, idx taskIndex, args []string) error {
 	fs.Var(&priority, "priority", "")
 	fs.Var(&project, "project", "")
 	fs.Var(&status, "status", "")
-	var tags multiValue
+	var waitingOn optionalString
+	fs.Var(&waitingOn, "waiting-on", "")
+	var tags, contexts multiValue
 	fs.Var(&tags, "tag", "")
+	fs.Var(&contexts, "context", "")
 	clearTags := fs.Bool("clear-tags", false, "")
+	clearContext := fs.Bool("clear-context", false, "")
 	if err := parseInterspersed(fs, args); err != nil {
 		return err
 	}
@@ -1693,6 +2216,21 @@ func commandUpdate(store *Store, idx taskIndex, args []string) error {
 		}
 		if len(tags) > 0 {
 			task.Tags = splitTags(tags)
+		}
+		if waitingOn.set {
+			// "me" is the default meaning of absent, so setting it back to me
+			// clears the field rather than writing a redundant owner.
+			if value := strings.TrimSpace(waitingOn.value); value == "" || strings.EqualFold(value, "me") {
+				task.WaitingOn = ""
+			} else {
+				task.WaitingOn = value
+			}
+		}
+		if *clearContext {
+			task.Contexts = nil
+		}
+		if len(contexts) > 0 {
+			task.Contexts = splitTags(contexts)
 		}
 		task.Updated = time.Now().Format("2006-01-02")
 		if err := store.writeTask(task); err != nil {

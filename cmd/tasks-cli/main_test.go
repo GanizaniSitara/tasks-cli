@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/json"
+	"io"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -571,6 +573,252 @@ func TestMigrateIsDryRunByDefault(t *testing.T) {
 	}
 }
 
+// captureRun runs the dispatch with stdout redirected and decodes the JSON, so
+// a command can be asserted on what it actually reports rather than only on the
+// files it leaves behind.
+func captureRun(t *testing.T, runner func(args ...string) error, args ...string) map[string]interface{} {
+	t.Helper()
+	real := os.Stdout
+	readPipe, writePipe, err := os.Pipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	os.Stdout = writePipe
+	runErr := runner(args...)
+	writePipe.Close()
+	os.Stdout = real
+	raw, err := io.ReadAll(readPipe)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if runErr != nil {
+		t.Fatalf("run(%v): %v", args, runErr)
+	}
+	var decoded map[string]interface{}
+	if err := json.Unmarshal(raw, &decoded); err != nil {
+		t.Fatalf("decode %v output %q: %v", args, string(raw), err)
+	}
+	return decoded
+}
+
+func nextIDs(t *testing.T, result map[string]interface{}) []string {
+	t.Helper()
+	rows, _ := result["results"].([]interface{})
+	ids := make([]string, 0, len(rows))
+	for _, row := range rows {
+		item, _ := row.(map[string]interface{})
+		ids = append(ids, item["task_id"].(string))
+	}
+	return ids
+}
+
+// pinToday freezes the clock seam so a deferral horizon does not depend on when
+// the suite runs.
+func pinToday(t *testing.T, value string) {
+	t.Helper()
+	original := today
+	today = func() string { return value }
+	t.Cleanup(func() { today = original })
+}
+
+// The whole point of next: a deferred, declined, waiting-on-someone or
+// wrong-context task is not work you can pick up, and must not lead the list.
+func TestNextSuppressesUnactionableWork(t *testing.T) {
+	pinToday(t, "2026-09-12")
+	tasks := sandboxRun(t)
+	for _, title := range []string{"Ready now", "Deferred", "Declined", "Waiting", "On the Mac"} {
+		if err := tasks("create", "--title", title, "--prefix", "OP", "--priority", "P2"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := tasks("defer", "OP-002", "--until", "2026-09-26"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks("decline", "OP-003", "--for", "14d"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks("update", "OP-004", "--waiting-on", "sellers"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks("update", "OP-005", "--context", "mac"); err != nil {
+		t.Fatal(err)
+	}
+
+	result := captureRun(t, tasks, "next", "--context", "desktop")
+	if got := nextIDs(t, result); len(got) != 1 || got[0] != "OP-001" {
+		t.Fatalf("next --context desktop = %v, want [OP-001]", got)
+	}
+	suppressed, _ := result["suppressed"].(map[string]interface{})
+	for _, key := range []string{"deferred", "declined", "waiting", "wrong_context"} {
+		if suppressed[key] != float64(1) {
+			t.Errorf("suppressed[%q] = %v, want 1", key, suppressed[key])
+		}
+	}
+
+	// --all must bring every one of them back, or the hiding is lossy.
+	if got := nextIDs(t, captureRun(t, tasks, "next", "--all")); len(got) != 5 {
+		t.Errorf("next --all returned %d tasks, want 5", len(got))
+	}
+	// A context nobody claimed still sees the unlabelled work.
+	if got := nextIDs(t, captureRun(t, tasks, "next", "--context", "mac")); len(got) != 2 {
+		t.Errorf("next --context mac = %v, want OP-001 and OP-005", got)
+	}
+}
+
+// A deferral expires by itself. Without this the field is just a nicer-looking
+// version of leaving the task in blocked forever.
+func TestNextReturnsTaskAfterDeferralLapses(t *testing.T) {
+	pinToday(t, "2026-09-12")
+	tasks := sandboxRun(t)
+	if err := tasks("create", "--title", "Comes back", "--prefix", "OP"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks("defer", "OP-001", "--for", "2w"); err != nil {
+		t.Fatal(err)
+	}
+	if got := nextIDs(t, captureRun(t, tasks, "next")); len(got) != 0 {
+		t.Fatalf("deferred task still offered: %v", got)
+	}
+	pinToday(t, "2026-09-27")
+	if got := nextIDs(t, captureRun(t, tasks, "next")); len(got) != 1 {
+		t.Fatalf("task did not return after its defer date: %v", got)
+	}
+}
+
+// Priority still wins; staleness only breaks ties. This is the rotation that
+// stops the same head leading the list every day.
+func TestNextRanksStalestFirstWithinAPriority(t *testing.T) {
+	pinToday(t, "2026-09-12")
+	store, _ := testStore(t)
+	if err := store.ensureStructure(); err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range []struct{ id, priority, updated string }{
+		{"OP-001", "P2", "2026-09-11"},
+		{"OP-002", "P2", "2026-01-04"},
+		{"OP-003", "P1", "2026-09-12"},
+	} {
+		task := &Task{
+			ID: row.id, Prefix: "OP", Title: row.id, Status: "backlog", Priority: row.priority,
+			Updated: row.updated, Path: filepath.Join(store.config.TasksRoot, "backlog", row.id+"-t.md"),
+		}
+		if err := store.writeTask(task); err != nil {
+			t.Fatal(err)
+		}
+	}
+	t.Setenv("TASKS_ROOT", store.config.TasksRoot)
+	t.Setenv("TASKS_INDEX_DIR", store.config.IndexDir)
+	t.Setenv("TASKS_CONFIG", filepath.Join(t.TempDir(), "missing.yaml"))
+	result := captureRun(t, func(args ...string) error { return run(args) }, "next")
+	got := nextIDs(t, result)
+	want := []string{"OP-003", "OP-002", "OP-001"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("next order = %v, want %v (P1 first, then stalest)", got, want)
+	}
+}
+
+// The reason must outlive the session that decided it, so it goes in the body
+// and not only into a frontmatter date.
+func TestDeferRecordsReasonAndClears(t *testing.T) {
+	pinToday(t, "2026-09-12")
+	tasks := sandboxRun(t)
+	if err := tasks("create", "--title", "Park me", "--prefix", "OP"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks("defer", "OP-001", "--until", "2026-09-26", "--because", "waiting on seller replies"); err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(os.Getenv("TASKS_ROOT"), "backlog", "OP-001-park-me.md")
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), "defer_until: \"2026-09-26\"") && !strings.Contains(string(raw), "defer_until: 2026-09-26") {
+		t.Errorf("defer_until not written:\n%s", raw)
+	}
+	if !strings.Contains(string(raw), "waiting on seller replies") {
+		t.Errorf("reason not recorded in the body:\n%s", raw)
+	}
+	if err := tasks("defer", "OP-001", "--clear"); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ = os.ReadFile(path)
+	if strings.Contains(string(raw), "defer_until:") {
+		t.Errorf("--clear left the field behind:\n%s", raw)
+	}
+}
+
+// Defer without a horizon is the mistake that turns a park into a disappearance.
+func TestDeferRequiresAHorizonButDeclineDefaults(t *testing.T) {
+	pinToday(t, "2026-09-12")
+	tasks := sandboxRun(t)
+	if err := tasks("create", "--title", "Needs a date", "--prefix", "OP"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks("defer", "OP-001"); err == nil {
+		t.Error("defer with no --until or --for should fail")
+	}
+	result := captureRun(t, tasks, "decline", "OP-001")
+	if result["declined_until"] != "2026-09-26" {
+		t.Errorf("decline default = %v, want 2026-09-26 (14 days)", result["declined_until"])
+	}
+}
+
+func TestBackfillIsDryRunByDefault(t *testing.T) {
+	tasks := sandboxRun(t)
+	if err := tasks("create", "--title", "Join-key inventory (AT WORK)", "--prefix", "OP"); err != nil {
+		t.Fatal(err)
+	}
+	result := captureRun(t, tasks, "backfill")
+	if result["count"] != float64(1) {
+		t.Fatalf("backfill should have found one task, got %v", result["count"])
+	}
+	path := filepath.Join(os.Getenv("TASKS_ROOT"), "backlog", "OP-001-join-key-inventory-at-work.md")
+	raw, _ := os.ReadFile(path)
+	if strings.Contains(string(raw), "context:") {
+		t.Errorf("dry run must not write:\n%s", raw)
+	}
+	if err := tasks("backfill", "--apply"); err != nil {
+		t.Fatal(err)
+	}
+	raw, _ = os.ReadFile(path)
+	if !strings.Contains(string(raw), "terminal") {
+		t.Errorf("--apply should have set context: terminal:\n%s", raw)
+	}
+}
+
+func TestParseForRejectsNonsense(t *testing.T) {
+	for _, good := range []struct {
+		value string
+		days  int
+	}{{"14d", 14}, {"2w", 14}, {"1m", 30}} {
+		if got, err := parseFor(good.value); err != nil || got != good.days {
+			t.Errorf("parseFor(%q) = %d, %v; want %d", good.value, got, err, good.days)
+		}
+	}
+	for _, bad := range []string{"", "14", "d", "0d", "-3d", "2y", "later"} {
+		if _, err := parseFor(bad); err == nil {
+			t.Errorf("parseFor(%q) should have failed", bad)
+		}
+	}
+}
+
+// A malformed date must not hide a task. Silent disappearance is worse than a
+// stale one appearing.
+func TestPendingIgnoresUnparseableDates(t *testing.T) {
+	for _, value := range []string{"", "soon", "2026-13-99", "next tuesday"} {
+		if pending(value, "2026-09-12") {
+			t.Errorf("pending(%q) = true, want false", value)
+		}
+	}
+	if !pending("2026-09-26", "2026-09-12") {
+		t.Error("a future date should be pending")
+	}
+	if pending("2026-09-12", "2026-09-12") {
+		t.Error("a task due today should be actionable, not pending")
+	}
+}
+
 // Every dispatchable command must have a help entry, and vice versa, so the
 // advertised "tasks-cli <command> --help" can never point at a missing block.
 func TestCommandHelpCoversEveryCommand(t *testing.T) {
@@ -578,6 +826,7 @@ func TestCommandHelpCoversEveryCommand(t *testing.T) {
 		"summary", "projects", "search", "get", "create", "update", "move",
 		"reopen", "delete", "duplicates", "dedupe", "note", "attach", "asset",
 		"lint", "pivot", "repair", "migrate", "index", "version",
+		"next", "defer", "decline", "backfill",
 	}
 	for _, command := range commands {
 		if _, ok := commandHelp[command]; !ok {
