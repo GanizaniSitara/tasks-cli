@@ -14,7 +14,7 @@ The command prints JSON so coding agents can use it safely from a shell.
 
 ## Commands
 
-`summary`, `projects`, `search`, `get`, `create`, `update`, `move`, `reopen`, `delete`, `duplicates`, `dedupe`, `note`, `attach`, `asset add|update|remove|list`, `lint`, `pivot`, `repair`, `migrate`, and `index sync|rebuild`.
+`summary`, `projects`, `search`, `next`, `get`, `create`, `update`, `move`, `reopen`, `delete`, `defer`, `decline`, `duplicates`, `dedupe`, `note`, `attach`, `asset add|update|remove|list`, `lint`, `pivot`, `repair`, `migrate`, `backfill`, and `index sync|rebuild`.
 
 Tickets and their companion assets each get a full set of verbs: `create`/`update`
 for the ticket body, `asset add`/`asset update`/`asset remove` for the files beside
@@ -30,6 +30,43 @@ this works without a readable config, so it is safe to probe on a fresh machine.
 
 There is no `list` command: `tasks-cli search` with no query lists tasks from disk,
 so `tasks-cli search --status in-progress` is the way to enumerate a status.
+
+## What is actionable, versus what exists
+
+`search` enumerates by priority then task id and nothing else, which answers "what
+is in the corpus". It does not answer "what should I do now": the same head leads
+the list every day until a status changes, so rejections get replayed, work that is
+waiting on somebody else is indistinguishable from work you could start this
+minute, and tickets that can only be done on another machine still appear.
+
+`next` answers the second question, using four optional frontmatter fields:
+
+| field | meaning |
+| --- | --- |
+| `defer_until: YYYY-MM-DD` | hidden until that date, then returns by itself |
+| `declined_until: YYYY-MM-DD` | "not this one" — set by `decline`, expires |
+| `waiting_on: me \| <party>` | anything but `me` is somebody else's move |
+| `context: [desktop, terminal, mac]` | where the work can physically happen |
+
+```
+tasks-cli next --context desktop     # local workstation / desktop
+tasks-cli next --context terminal    # remote work (e.g. from office / console)
+tasks-cli defer EYE-022 --until 2026-09-26 --because "waiting on seller replies"
+tasks-cli decline OP-249 --for 14d --because "not this fortnight"
+```
+
+Every field is optional and absence preserves the old behaviour, so nothing has to
+be migrated before `next` is useful. A task that declares no context matches every
+context — unlabelled work could be doable anywhere, and hiding it would lose it.
+The `suppressed` counts in the output say how many tasks were hidden and why, so an
+empty list is never ambiguous about whether you are finished or merely filtered.
+
+Within a priority band, ties break by staleness (oldest `updated` first) so the head
+of the list rotates; `--warm` flips it to freshest first.
+
+`backfill` converts existing conventions into context data — titles containing
+"(AT WORK)" become `context: terminal`, and `--mac-prefix CSF --mac-prefix GOL` marks
+those prefixes `context: mac`. Dry run unless `--apply`.
 
 ## Install
 
