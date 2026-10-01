@@ -32,13 +32,14 @@ var (
 	buildTime   = "unknown"
 )
 
-var statuses = []string{"backlog", "in-progress", "blocked", "done"}
+var statuses = []string{"backlog", "in-progress", "blocked", "done", "wont-do"}
 
 var statusAliases = map[string]string{
 	"todo": "backlog", "queued": "backlog", "backlog": "backlog",
 	"in_progress": "in-progress", "in-progress": "in-progress", "progress": "in-progress", "working": "in-progress",
 	"blocked": "blocked", "block": "blocked", "stalled": "blocked",
 	"done": "done", "complete": "done", "completed": "done", "closed": "done",
+	"wont-do": "wont-do", "wontdo": "wont-do", "wont_do": "wont-do", "won't-do": "wont-do", "wontfix": "wont-do", "dropped": "wont-do",
 }
 
 var readableAssetSuffixes = map[string]bool{
@@ -1827,7 +1828,7 @@ func commandBackfill(store *Store, idx taskIndex, args []string) error {
 		}
 		actions := []map[string]interface{}{}
 		for _, task := range tasks {
-			if task.Status == "done" || len(task.Contexts) > 0 {
+			if task.Status == "done" || task.Status == "wont-do" || len(task.Contexts) > 0 {
 				continue
 			}
 			var contexts []string
@@ -2379,8 +2380,8 @@ func commandReopen(store *Store, idx taskIndex, args []string) error {
 		if err != nil {
 			return err
 		}
-		if task.Status != "done" {
-			return fmt.Errorf("only done tasks can be reopened")
+		if task.Status != "done" && task.Status != "wont-do" {
+			return fmt.Errorf("only done or wont-do tasks can be reopened")
 		}
 		task.Body = appendHeading(task.Body, "History", fmt.Sprintf("%s — reopened to %s", time.Now().Format("2006-01-02"), target))
 		if err := moveTask(store, task, target, "error"); err != nil {
