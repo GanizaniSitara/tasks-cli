@@ -546,6 +546,27 @@ func TestReopenOnlyFromDone(t *testing.T) {
 	}
 }
 
+func TestWontDoIsSeparateFromDone(t *testing.T) {
+	tasks := sandboxRun(t)
+	if err := tasks("create", "--title", "Dropped idea", "--prefix", "OP"); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks("move", "OP-001", "wontfix"); err != nil {
+		t.Fatalf("move to wont-do via alias: %v", err)
+	}
+	root := os.Getenv("TASKS_ROOT")
+	matches, err := filepath.Glob(filepath.Join(root, "wont-do", "OP-001-*.md"))
+	if err != nil || len(matches) != 1 {
+		t.Fatalf("task not in wont-do: %v (err %v)", matches, err)
+	}
+	if done, _ := filepath.Glob(filepath.Join(root, "done", "OP-001-*.md")); len(done) != 0 {
+		t.Fatalf("wont-do task leaked into done: %v", done)
+	}
+	if err := tasks("reopen", "OP-001"); err != nil {
+		t.Fatalf("reopen from wont-do: %v", err)
+	}
+}
+
 func TestMigrateIsDryRunByDefault(t *testing.T) {
 	tasks := sandboxRun(t)
 	if err := tasks("create", "--title", "Original title", "--prefix", "OP"); err != nil {
