@@ -187,6 +187,8 @@ func run(args []string) error {
 		return commandGet(store, args[1:])
 	case "create":
 		return commandCreate(store, index, args[1:])
+	case "bulk-add":
+		return commandBulkAdd(store, index, args[1:])
 	case "update":
 		return commandUpdate(store, index, args[1:])
 	case "move":
@@ -224,7 +226,7 @@ func printHelp() {
 	fmt.Println(`tasks-cli <command> [flags]
 
 Commands:
-  summary | projects | search | next | get | create | update | move | reopen
+  summary | projects | search | next | get | create | bulk-add | update | move | reopen
   delete | defer | decline | duplicates | dedupe | note | attach | lint | pivot
   repair | migrate | backfill | index sync | index rebuild | version
 
@@ -404,6 +406,19 @@ allowlist; the command will not invent a new project code.
 
   tasks-cli create --title "Index companion files" --prefix PROJ --tag go --tag cli`,
 
+	"bulk-add": `tasks-cli bulk-add --file PATH [--dry-run]
+
+Create tasks from a JSON array. Use --file - to read stdin.
+Each object accepts title (required), description, prefix, project, status,
+priority, and tags (an array of strings), matching create's defaults.
+Unknown fields, empty batches, and invalid entries reject the whole batch.
+Validation completes before writing; IDs are allocated under one corpus lock
+and the index is synced once. Output contains count, tasks, dry_run, and sync.
+
+  --file PATH       JSON file, or - for stdin (required)
+  --dry-run         preview tasks and IDs without writing tasks or index
+
+  tasks-cli bulk-add --file tasks.json`,
 	"update": `tasks-cli update TASK-ID [flags]
 
 Update metadata or body. Only the flags you pass are changed. Renaming the
@@ -2066,67 +2081,176 @@ func commandCreate(store *Store, idx taskIndex, args []string) error {
 		}
 		*description = string(value)
 	}
-	normalizedStatus, err := normalizeStatus(*status)
+	tasks, sync, err := createTasks(store, idx, []createInput{{
+		Title: *title, Description: *description, Prefix: *prefix, Project: *project,
+		Status: *status, Priority: *priority, Tags: tags,
+	}}, false)
 	if err != nil {
 		return err
 	}
-	return withLock(store.config.TasksRoot, func() error {
-		chosenPrefix := *prefix
-		if chosenPrefix == "" {
-			chosenPrefix = *project
-		}
-		if chosenPrefix == "" {
-			chosenPrefix = store.config.DefaultPrefix
-		}
-		chosenPrefix, err = store.validatePrefix(chosenPrefix)
+	emit(map[string]interface{}{"task": taskMap(tasks[0], true), "sync": sync})
+	return nil
+}
+
+type createInput struct {
+	Title       string   `json:"title"`
+	Description string   `json:"description"`
+	Prefix      string   `json:"prefix"`
+	Project     string   `json:"project"`
+	Status      string   `json:"status"`
+	Priority    string   `json:"priority"`
+	Tags        []string `json:"tags"`
+}
+
+func commandBulkAdd(store *Store, idx taskIndex, args []string) error {
+	fs := flag.NewFlagSet("bulk-add", flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	file := fs.String("file", "", "")
+	dryRun := fs.Bool("dry-run", false, "")
+	if err := parseInterspersed(fs, args); err != nil {
+		return err
+	}
+	if *file == "" || len(fs.Args()) != 0 {
+		return fmt.Errorf("usage: tasks-cli bulk-add --file PATH [--dry-run]")
+	}
+	var reader io.Reader = os.Stdin
+	if *file != "-" {
+		input, err := os.Open(*file)
 		if err != nil {
 			return err
 		}
-		chosenProject := chosenPrefix
-		if *project != "" {
-			chosenProject = strings.ToUpper(*project)
+		defer input.Close()
+		reader = input
+	}
+	decoder := json.NewDecoder(reader)
+	decoder.DisallowUnknownFields()
+	var rows []createInput
+	if err := decoder.Decode(&rows); err != nil {
+		return fmt.Errorf("bulk-add JSON: %w", err)
+	}
+	if err := decoder.Decode(new(interface{})); err != io.EOF {
+		return fmt.Errorf("bulk-add requires exactly one JSON array")
+	}
+	if len(rows) == 0 {
+		return fmt.Errorf("bulk-add requires a non-empty JSON array")
+	}
+	tasks, sync, err := createTasks(store, idx, rows, *dryRun)
+	if err != nil {
+		return err
+	}
+	result := make([]map[string]interface{}, 0, len(tasks))
+	for _, task := range tasks {
+		result = append(result, taskMap(task, true))
+	}
+	emit(map[string]interface{}{"count": len(tasks), "tasks": result, "dry_run": *dryRun, "sync": sync})
+	return nil
+}
+
+// Both creation commands use the same defaults, validation, and ID allocator.
+// Validate the entire input before taking the lock or writing any task.
+func createTasks(store *Store, idx taskIndex, rows []createInput, dryRun bool) ([]*Task, map[string]interface{}, error) {
+	for i := range rows {
+		row := &rows[i]
+		row.Title = strings.TrimSpace(row.Title)
+		if row.Title == "" {
+			return nil, nil, fmt.Errorf("entry %d: title is required", i+1)
 		}
-		tasks, err := store.scanTasks()
+		if row.Prefix == "" {
+			row.Prefix = row.Project
+		}
+		if row.Prefix == "" {
+			row.Prefix = store.config.DefaultPrefix
+		}
+		var err error
+		row.Prefix, err = store.validatePrefix(row.Prefix)
+		if err != nil {
+			return nil, nil, fmt.Errorf("entry %d: %w", i+1, err)
+		}
+		if row.Project == "" {
+			row.Project = row.Prefix
+		} else {
+			row.Project = strings.ToUpper(row.Project)
+		}
+		if row.Status == "" {
+			row.Status = "backlog"
+		}
+		row.Status, err = normalizeStatus(row.Status)
+		if err != nil {
+			return nil, nil, fmt.Errorf("entry %d: %w", i+1, err)
+		}
+	}
+	var created []*Task
+	var sync map[string]interface{}
+	err := withLock(store.config.TasksRoot, func() error {
+		existing, err := store.scanTasks()
 		if err != nil {
 			return err
 		}
-		next := 1
+		maxByPrefix := map[string]int{}
 		claim := func(prefix string, number int) {
-			if strings.EqualFold(prefix, chosenPrefix) && number >= next {
-				next = number + 1
+			prefix = strings.ToUpper(prefix)
+			if number > maxByPrefix[prefix] {
+				maxByPrefix[prefix] = number
 			}
 		}
-		for _, task := range tasks {
+		for _, task := range existing {
 			claim(task.Prefix, task.Number)
-			// A file whose frontmatter disagrees with its filename still owns
-			// the number its name claims. Allocating from the frontmatter alone
-			// hands that number out again and the two files collide by name in
-			// different status directories -- invisible to `duplicates`, since
-			// their ids differ.
+			// A mismatched filename still owns the number its name claims.
 			stemID, _ := splitStem(strings.TrimSuffix(filepath.Base(task.Path), filepath.Ext(task.Path)))
 			claim(parseID(stemID))
 		}
-		id := canonicalTaskID(chosenPrefix, next)
-		slug := slugify(*title)
-		if slug == "" {
-			slug = "untitled"
+		date := time.Now().Format("2006-01-02")
+		for _, row := range rows {
+			maxByPrefix[row.Prefix]++
+			number := maxByPrefix[row.Prefix]
+			id := canonicalTaskID(row.Prefix, number)
+			slug := slugify(row.Title)
+			if slug == "" {
+				slug = "untitled"
+			}
+			path := filepath.Join(store.config.TasksRoot, row.Status, id+"-"+slug+".md")
+			created = append(created, &Task{
+				ID: id, Prefix: row.Prefix, Project: row.Project, Number: number,
+				Title: row.Title, Status: row.Status, Priority: strings.TrimSpace(row.Priority),
+				Created: date, Updated: date, Tags: splitTags(row.Tags), Path: path,
+				CompanionDir: strings.TrimSuffix(path, ".md"), Frontmatter: map[string]interface{}{}, Body: row.Description,
+			})
 		}
-		path := filepath.Join(store.config.TasksRoot, normalizedStatus, id+"-"+slug+".md")
-		today := time.Now().Format("2006-01-02")
-		task := &Task{ID: id, Prefix: chosenPrefix, Project: chosenProject, Number: next, Title: strings.TrimSpace(*title), Status: normalizedStatus, Priority: strings.TrimSpace(*priority), Created: today, Updated: today, Tags: splitTags(tags), Path: path, CompanionDir: strings.TrimSuffix(path, ".md"), Frontmatter: map[string]interface{}{}, Body: *description}
-		if err := os.MkdirAll(task.CompanionDir, 0o755); err != nil {
-			return err
+		if dryRun {
+			return nil
 		}
-		if err := store.writeTask(task); err != nil {
-			return err
+		// Only remove paths this batch created if a task write fails.
+		var written []*Task
+		rollback := func(cause error) error {
+			for _, task := range written {
+				if err := os.Remove(task.Path); err != nil && !os.IsNotExist(err) {
+					cause = errors.Join(cause, fmt.Errorf("rollback %s: %w", task.Path, err))
+				}
+				if err := os.Remove(task.CompanionDir); err != nil {
+					cause = errors.Join(cause, fmt.Errorf("rollback %s: %w", task.CompanionDir, err))
+				}
+			}
+			return cause
 		}
-		sync, err := idx.sync(store)
+		for _, task := range created {
+			if _, err := os.Stat(task.Path); !os.IsNotExist(err) {
+				return rollback(fmt.Errorf("task path unavailable: %s", task.Path))
+			}
+			if err := os.Mkdir(task.CompanionDir, 0o755); err != nil {
+				return rollback(err)
+			}
+			written = append(written, task)
+			if err := store.writeTask(task); err != nil {
+				return rollback(err)
+			}
+		}
+		sync, err = idx.sync(store)
 		if err != nil {
-			return err
+			return fmt.Errorf("%d tasks created, but index sync failed; run tasks-cli index sync: %w", len(created), err)
 		}
-		emit(map[string]interface{}{"task": taskMap(task, true), "sync": sync})
 		return nil
 	})
+	return created, sync, err
 }
 
 func splitTags(values []string) []string {

@@ -14,7 +14,7 @@ The command prints JSON so coding agents can use it safely from a shell.
 
 ## Commands
 
-`summary`, `projects`, `search`, `next`, `get`, `create`, `update`, `move`, `reopen`, `delete`, `defer`, `decline`, `duplicates`, `dedupe`, `note`, `attach`, `asset add|update|remove|list`, `lint`, `pivot`, `repair`, `migrate`, `backfill`, and `index sync|rebuild`.
+`summary`, `projects`, `search`, `next`, `get`, `create`, `bulk-add`, `update`, `move`, `reopen`, `delete`, `defer`, `decline`, `duplicates`, `dedupe`, `note`, `attach`, `asset add|update|remove|list`, `lint`, `pivot`, `repair`, `migrate`, `backfill`, and `index sync|rebuild`.
 
 Tickets and their companion assets each get a full set of verbs: `create`/`update`
 for the ticket body, `asset add`/`asset update`/`asset remove` for the files beside
@@ -106,6 +106,35 @@ are dry-runs unless given `--apply`.
 alone, so links stay valid. `tasks-cli migrate` reconciles file stems with titles.
 If the legacy Python service or another non-CLI writer changes the corpus, run
 `tasks-cli index sync` before the next indexed search.
+
+## Bulk creation
+
+`bulk-add` accepts a JSON array from a file or stdin (`--file -`):
+
+```json
+[
+  {"title": "Review the plan", "prefix": "PROJ", "priority": "P2", "tags": ["planning"]},
+  {"title": "Write the summary", "prefix": "PROJ", "description": "Capture the decisions."}
+]
+```
+
+```sh
+tasks-cli bulk-add --file tasks.json --dry-run
+tasks-cli bulk-add --file tasks.json
+```
+
+Each entry supports `title` (required), `description`, `prefix`, `project`,
+`status`, `priority`, and `tags`. Defaults match `create`: backlog status,
+configured default prefix (or `project` when supplied), and project equal to
+prefix. Prefixes must already be allowed. Unknown fields, malformed input, or
+an invalid entry reject the entire batch before any tasks are written.
+
+The batch takes one corpus lock, scans for IDs once, creates companion
+directories, and syncs the index once. Output lists the created `tasks` in input
+order along with `count`, `dry_run`, and `sync`. Dry runs write no tasks or index;
+the preview IDs are not reserved. If a task write fails, the command removes
+tasks and empty companion directories it created. If index sync fails after
+creation, the error says the tasks were saved and asks for `tasks-cli index sync`.
 
 ## Configuration
 

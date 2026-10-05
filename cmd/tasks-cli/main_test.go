@@ -226,6 +226,138 @@ func TestCreateAllocatesSequentialIDs(t *testing.T) {
 	}
 }
 
+func bulkInput(t *testing.T, body string) string {
+	t.Helper()
+	path := filepath.Join(t.TempDir(), "batch.json")
+	if err := os.WriteFile(path, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return path
+}
+
+func TestBulkAddAllocatesAcrossPrefixesAndIndexes(t *testing.T) {
+	tasks := sandboxRun(t)
+	if err := tasks("create", "--title", "Existing", "--prefix", "OP"); err != nil {
+		t.Fatal(err)
+	}
+	root := os.Getenv("TASKS_ROOT")
+	// Frontmatter and filename claims must both be respected across statuses.
+	if err := os.WriteFile(filepath.Join(root, "done", "OP-005-mismatch.md"), []byte("---\ntask: OP-003\ntitle: Mismatch\nstatus: done\n---\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	path := bulkInput(t, `[
+		{"title":"First batch task","description":"uniquebulkkeyword","priority":"P2","tags":["go","cli"]},
+		{"title":"Project task","project":"proj","status":"working"},
+		{"title":"Second batch task","prefix":"op"}
+	]`)
+	result := captureRun(t, tasks, "bulk-add", "--file", path)
+	if result["count"] != float64(3) || result["dry_run"] != false || result["sync"] == nil {
+		t.Fatalf("unexpected bulk output: %v", result)
+	}
+	rows := result["tasks"].([]interface{})
+	for i, id := range []string{"OP-006", "PROJ-001", "OP-007"} {
+		row := rows[i].(map[string]interface{})
+		if row["task_id"] != id {
+			t.Errorf("row %d ID = %v, want %s", i, row["task_id"], id)
+		}
+		if info, err := os.Stat(row["companion_dir"].(string)); err != nil || !info.IsDir() {
+			t.Fatalf("missing companion directory for %s: %v", id, err)
+		}
+	}
+	if rows[1].(map[string]interface{})["status"] != "in-progress" {
+		t.Error("status alias not normalized")
+	}
+	search := captureRun(t, tasks, "search", "uniquebulkkeyword")
+	if ids := nextIDs(t, search); len(ids) != 1 || ids[0] != "OP-006" {
+		t.Fatalf("bulk task absent from index: %v", ids)
+	}
+	if err := tasks("create", "--title", "After batch"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(filepath.Join(root, "backlog", "OP-008-after-batch.md")); err != nil {
+		t.Fatalf("single create did not continue batch numbering: %v", err)
+	}
+}
+
+func TestBulkAddRejectsWholeInvalidBatch(t *testing.T) {
+	for _, body := range []string{
+		`[{"title":"Valid"},{"title":" "}]`,
+		`[{"title":"Valid"},{"title":"Bad prefix","prefix":"ZZZ"}]`,
+		`[{"title":"Valid"},{"title":"Bad status","status":"missing"}]`,
+		`[{"title":"Valid","typo":"oops"}]`,
+		`[{"title":"Valid","tags":"go"}]`,
+		`[{"title":"Valid"},null]`,
+		`[]`, `null`, `{}`, `[`, `[{"title":"Valid"}] []`,
+	} {
+		t.Run(body, func(t *testing.T) {
+			tasks := sandboxRun(t)
+			if err := tasks("bulk-add", "--file", bulkInput(t, body)); err == nil {
+				t.Fatal("invalid batch accepted")
+			}
+			if _, err := os.Stat(os.Getenv("TASKS_ROOT")); !os.IsNotExist(err) {
+				t.Fatalf("validation failure changed corpus: %v", err)
+			}
+		})
+	}
+}
+
+func TestBulkAddDryRunAndStdin(t *testing.T) {
+	tasks := sandboxRun(t)
+	path := bulkInput(t, `[{"title":"Preview"},{"title":"Second"}]`)
+	preview := captureRun(t, tasks, "bulk-add", "--file", path, "--dry-run")
+	if preview["dry_run"] != true || preview["sync"] != nil {
+		t.Fatalf("unexpected preview: %v", preview)
+	}
+	if matches, _ := filepath.Glob(filepath.Join(os.Getenv("TASKS_ROOT"), "*", "*.md")); len(matches) != 0 {
+		t.Fatalf("dry run wrote tasks: %v", matches)
+	}
+	if _, err := os.Stat(os.Getenv("TASKS_INDEX_DIR")); !os.IsNotExist(err) {
+		t.Fatalf("dry run created index: %v", err)
+	}
+	input, err := os.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer input.Close()
+	original := os.Stdin
+	os.Stdin = input
+	t.Cleanup(func() { os.Stdin = original })
+	actual := captureRun(t, tasks, "bulk-add", "--file", "-")
+	for i, row := range actual["tasks"].([]interface{}) {
+		if row.(map[string]interface{})["task_id"] != preview["tasks"].([]interface{})[i].(map[string]interface{})["task_id"] {
+			t.Fatal("dry run consumed task IDs")
+		}
+	}
+}
+
+func TestBulkAddRollsBackOnWriteFailure(t *testing.T) {
+	tasks := sandboxRun(t)
+	store, err := newStore()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.ensureStructure(); err != nil {
+		t.Fatal(err)
+	}
+	root := os.Getenv("TASKS_ROOT")
+	// An orphan companion prevents the second creation; keep it intact.
+	orphan := filepath.Join(root, "backlog", "OP-002-second")
+	if err := os.Mkdir(orphan, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks("bulk-add", "--file", bulkInput(t, `[{"title":"First"},{"title":"Second"}]`)); err == nil {
+		t.Fatal("expected companion collision to fail")
+	}
+	for _, path := range []string{"OP-001-first.md", "OP-001-first"} {
+		if _, err := os.Stat(filepath.Join(root, "backlog", path)); !os.IsNotExist(err) {
+			t.Fatalf("partial creation left behind: %s: %v", path, err)
+		}
+	}
+	if _, err := os.Stat(orphan); err != nil {
+		t.Fatalf("existing companion removed: %v", err)
+	}
+}
+
 // A file whose frontmatter id disagrees with its filename still owns the
 // number its name claims. Allocating from the frontmatter alone hands that
 // number out again, producing two files with the same name in different status
@@ -844,7 +976,7 @@ func TestPendingIgnoresUnparseableDates(t *testing.T) {
 // advertised "tasks-cli <command> --help" can never point at a missing block.
 func TestCommandHelpCoversEveryCommand(t *testing.T) {
 	commands := []string{
-		"summary", "projects", "search", "get", "create", "update", "move",
+		"summary", "projects", "search", "get", "create", "bulk-add", "update", "move",
 		"reopen", "delete", "duplicates", "dedupe", "note", "attach", "asset",
 		"lint", "pivot", "repair", "migrate", "index", "version",
 		"next", "defer", "decline", "backfill",
