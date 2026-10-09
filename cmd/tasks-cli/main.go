@@ -364,6 +364,9 @@ how you enumerate a status (there is no separate "list" command).
   --prefix PREFIX      restrict to one project prefix, e.g. PROJ
   --project PROJECT    restrict to one project field
   --limit N            maximum results (default 20)
+  --all                return all results without limit cut-off
+  --sort MODE          hybrid (default) | score | recency | priority
+  --no-synonyms        disable domain synonym expansion
   --brief              emit id, title, priority, status, project, updated only
   --include-content    include companion-file text in each result
 
@@ -1360,49 +1363,238 @@ func (idx taskIndex) rebuild(store *Store) (map[string]interface{}, error) {
 	return idx.sync(store)
 }
 
-func (idx taskIndex) search(store *Store, query, status, prefix, project string, limit int, includeAssetContent bool) ([]*Task, map[string]interface{}, error) {
+var defaultSynonymGroups = [][]string{
+	{"scrape", "scraping", "scraper", "scrapers", "scraped", "harvest", "harvesting", "harvester", "harvested", "mine", "mining"},
+	{"transcript", "transcripts", "transcription", "log", "logs", "logging", "history", "session", "sessions"},
+	{"reminder", "reminders", "remind", "alert", "alerts", "alerting", "notification", "notifications", "notify"},
+	{"monitor", "monitoring", "watcher", "watching", "tracker", "tracking"},
+	{"spec", "specification", "specifications", "design", "rfc"},
+	{"cli", "tool", "tools", "utility", "command", "binary"},
+	{"config", "configuration", "settings", "options"},
+	{"bug", "issue", "defect", "error", "failure"},
+}
+
+func buildSynonymMap(groups [][]string) map[string][]string {
+	m := make(map[string][]string)
+	for _, group := range groups {
+		for _, term := range group {
+			lowerTerm := strings.ToLower(term)
+			for _, other := range group {
+				lowerOther := strings.ToLower(other)
+				if lowerOther != lowerTerm && !containsString(m[lowerTerm], lowerOther) {
+					m[lowerTerm] = append(m[lowerTerm], lowerOther)
+				}
+			}
+		}
+	}
+	return m
+}
+
+func (s *Store) loadSynonyms() map[string][]string {
+	groups := make([][]string, len(defaultSynonymGroups))
+	copy(groups, defaultSynonymGroups)
+
+	var synPaths []string
+	if s != nil {
+		if s.configPath != "" {
+			synPaths = append(synPaths, filepath.Join(filepath.Dir(s.configPath), "synonyms.yaml"))
+		}
+		if s.config.TasksRoot != "" {
+			synPaths = append(synPaths, filepath.Join(s.config.TasksRoot, ".synonyms.yaml"))
+		}
+	}
+
+	for _, p := range synPaths {
+		if raw, err := os.ReadFile(p); err == nil {
+			var custom struct {
+				Groups [][]string `yaml:"groups"`
+			}
+			if err := yaml.Unmarshal(raw, &custom); err == nil && len(custom.Groups) > 0 {
+				groups = append(groups, custom.Groups...)
+			}
+		}
+	}
+	return buildSynonymMap(groups)
+}
+
+func taskDate(task *Task) time.Time {
+	if task == nil {
+		return time.Time{}
+	}
+	for _, dateStr := range []string{task.Updated, task.Created} {
+		dateStr = strings.TrimSpace(dateStr)
+		if dateStr == "" {
+			continue
+		}
+		if t, err := time.Parse("2006-01-02", dateStr); err == nil {
+			return t
+		}
+		if t, err := time.Parse(time.RFC3339, dateStr); err == nil {
+			return t
+		}
+	}
+	if task.Path != "" {
+		if fi, err := os.Stat(task.Path); err == nil {
+			return fi.ModTime()
+		}
+	}
+	return time.Time{}
+}
+
+func recencyMultiplier(task *Task) float64 {
+	t := taskDate(task)
+	if t.IsZero() {
+		return 1.0
+	}
+	days := time.Since(t).Hours() / 24.0
+	if days < 0 {
+		days = 0
+	}
+	// Bounded boost factor: starts at 2.0 for today (days=0), decaying smoothly towards 1.0.
+	// At 14 days, multiplier is 1.5. At 60 days, ~1.19. At 180 days, ~1.07.
+	return 1.0 + 1.0/(1.0+days/14.0)
+}
+
+type searchOptions struct {
+	Query               string
+	Status              string
+	Prefix              string
+	Project             string
+	Limit               int
+	IncludeAssetContent bool
+	Sort                string
+	NoSynonyms          bool
+}
+
+type scoredHit struct {
+	Path  string
+	Score float64
+}
+
+func (idx taskIndex) searchWithOptions(store *Store, opts searchOptions) ([]*Task, int, map[string]interface{}, error) {
 	index, err := idx.open()
 	if err != nil {
-		return nil, nil, err
+		return nil, 0, nil, err
 	}
 	defer index.Close()
-	query = strings.TrimSpace(query)
+	query := strings.TrimSpace(opts.Query)
 
-	// Run strictly first: every query term must appear somewhere in the task.
-	// If that finds nothing, fall back to the permissive any-term search so a
-	// query is never answered with silence when partial matches exist -- but
-	// say so in the emitted mode, because the two mean very different things.
+	var synMap map[string][]string
+	if !opts.NoSynonyms && store != nil {
+		synMap = store.loadSynonyms()
+	}
+
 	matched := "bleve"
-	hits, err := idx.runQuery(index, buildQuery(query, true), status, prefix, project, limit)
+	candLimit := opts.Limit * 10
+	if candLimit < 100 {
+		candLimit = 100
+	}
+	if candLimit > 2000 {
+		candLimit = 2000
+	}
+	if opts.Limit <= 0 {
+		candLimit = 10000
+	}
+
+	hits, totalHits, err := idx.runQuery(index, buildQuery(query, true, synMap), opts.Status, opts.Prefix, opts.Project, candLimit)
 	if err != nil {
-		return nil, nil, err
+		return nil, 0, nil, err
 	}
 	if len(hits) == 0 && query != "" {
 		matched = "bleve-relaxed"
-		hits, err = idx.runQuery(index, buildQuery(query, false), status, prefix, project, limit)
+		hits, totalHits, err = idx.runQuery(index, buildQuery(query, false, synMap), opts.Status, opts.Prefix, opts.Project, candLimit)
 		if err != nil {
-			return nil, nil, err
+			return nil, 0, nil, err
 		}
 	}
 
-	var out []*Task
-	for _, path := range hits {
-		statusName := filepath.Base(filepath.Dir(path))
+	type candidate struct {
+		task  *Task
+		score float64
+	}
+	candidates := make([]candidate, 0, len(hits))
+	for _, hit := range hits {
+		statusName := filepath.Base(filepath.Dir(hit.Path))
 		var task *Task
 		var err error
-		if includeAssetContent {
-			task, err = store.parseTask(path, statusName)
+		if opts.IncludeAssetContent {
+			task, err = store.parseTask(hit.Path, statusName)
 		} else {
-			task, err = store.parseTaskLite(path, statusName)
+			task, err = store.parseTaskLite(hit.Path, statusName)
 		}
 		if err == nil {
-			out = append(out, task)
+			candidates = append(candidates, candidate{task: task, score: hit.Score})
 		}
-		if len(out) >= limit {
+	}
+
+	switch strings.ToLower(opts.Sort) {
+	case "recency", "recent", "date":
+		sort.Slice(candidates, func(i, j int) bool {
+			di, dj := taskDate(candidates[i].task), taskDate(candidates[j].task)
+			if !di.Equal(dj) {
+				return di.After(dj)
+			}
+			if candidates[i].score != candidates[j].score {
+				return candidates[i].score > candidates[j].score
+			}
+			return candidates[i].task.ID < candidates[j].task.ID
+		})
+	case "score", "relevance":
+		sort.Slice(candidates, func(i, j int) bool {
+			if candidates[i].score != candidates[j].score {
+				return candidates[i].score > candidates[j].score
+			}
+			di, dj := taskDate(candidates[i].task), taskDate(candidates[j].task)
+			if !di.Equal(dj) {
+				return di.After(dj)
+			}
+			return candidates[i].task.ID < candidates[j].task.ID
+		})
+	case "priority":
+		sort.Slice(candidates, func(i, j int) bool {
+			pi, pj := priorityRank(candidates[i].task.Priority), priorityRank(candidates[j].task.Priority)
+			if pi != pj {
+				return pi < pj
+			}
+			if candidates[i].score != candidates[j].score {
+				return candidates[i].score > candidates[j].score
+			}
+			return candidates[i].task.ID < candidates[j].task.ID
+		})
+	default: // "hybrid"
+		sort.Slice(candidates, func(i, j int) bool {
+			si := candidates[i].score * recencyMultiplier(candidates[i].task)
+			sj := candidates[j].score * recencyMultiplier(candidates[j].task)
+			if si != sj {
+				return si > sj
+			}
+			return candidates[i].task.ID < candidates[j].task.ID
+		})
+	}
+
+	out := make([]*Task, 0, len(candidates))
+	for _, c := range candidates {
+		out = append(out, c.task)
+		if opts.Limit > 0 && len(out) >= opts.Limit {
 			break
 		}
 	}
-	return out, map[string]interface{}{"index_dir": idx.dir, "mode": "on-write", "matched": matched}, nil
+
+	meta := map[string]interface{}{"index_dir": idx.dir, "mode": "on-write", "matched": matched}
+	return out, totalHits, meta, nil
+}
+
+func (idx taskIndex) search(store *Store, query, status, prefix, project string, limit int, includeAssetContent bool) ([]*Task, map[string]interface{}, error) {
+	tasks, _, meta, err := idx.searchWithOptions(store, searchOptions{
+		Query:               query,
+		Status:              status,
+		Prefix:              prefix,
+		Project:             project,
+		Limit:               limit,
+		IncludeAssetContent: includeAssetContent,
+		Sort:                "hybrid",
+	})
+	return tasks, meta, err
 }
 
 // buildQuery turns a query string into a Bleve query.
@@ -1416,7 +1608,7 @@ func (idx taskIndex) search(store *Store, query, status, prefix, project string,
 // is what made the previous Whoosh-backed search feel precise; Bleve's
 // MatchQuery ORs its terms, which is why a nonsense query still returned a full
 // page of confident-looking results.
-func buildQuery(query string, requireAll bool) blevequery.Query {
+func buildQuery(query string, requireAll bool, synMap map[string][]string) blevequery.Query {
 	terms := strings.Fields(query)
 	if len(terms) == 0 {
 		return bleve.NewMatchAllQuery()
@@ -1437,7 +1629,32 @@ func buildQuery(query string, requireAll bool) blevequery.Query {
 		tags.SetBoost(3)
 		content := bleve.NewMatchQuery(term)
 		content.SetField("content")
-		groups = append(groups, bleve.NewDisjunctionQuery(id, title, tags, content))
+		disj := []blevequery.Query{id, title, tags, content}
+
+		if synMap != nil {
+			cleanTerm := strings.Trim(strings.ToLower(term), ".,;:!?'\"()[]{}")
+			if syns, ok := synMap[cleanTerm]; ok {
+				for _, syn := range syns {
+					if strings.EqualFold(syn, term) {
+						continue
+					}
+					st := bleve.NewMatchQuery(syn)
+					st.SetField("title")
+					st.SetBoost(2.5)
+
+					stag := bleve.NewMatchQuery(syn)
+					stag.SetField("tags")
+					stag.SetBoost(1.5)
+
+					sc := bleve.NewMatchQuery(syn)
+					sc.SetField("content")
+					sc.SetBoost(0.5)
+
+					disj = append(disj, st, stag, sc)
+				}
+			}
+		}
+		groups = append(groups, bleve.NewDisjunctionQuery(disj...))
 	}
 	if len(groups) == 1 {
 		return groups[0]
@@ -1450,7 +1667,7 @@ func buildQuery(query string, requireAll bool) blevequery.Query {
 
 // runQuery applies the status/prefix/project filters and returns matching paths
 // in score order.
-func (idx taskIndex) runQuery(index bleve.Index, root blevequery.Query, status, prefix, project string, limit int) ([]string, error) {
+func (idx taskIndex) runQuery(index bleve.Index, root blevequery.Query, status, prefix, project string, limit int) ([]scoredHit, int, error) {
 	filters := []blevequery.Query{root}
 	for field, value := range map[string]string{"status": status, "prefix": prefix, "project": project} {
 		if strings.TrimSpace(value) == "" {
@@ -1463,16 +1680,16 @@ func (idx taskIndex) runQuery(index bleve.Index, root blevequery.Query, status, 
 	if len(filters) > 1 {
 		root = bleve.NewConjunctionQuery(filters...)
 	}
-	request := bleve.NewSearchRequestOptions(root, limit*4, 0, false)
+	request := bleve.NewSearchRequestOptions(root, limit, 0, false)
 	result, err := index.Search(request)
 	if err != nil {
-		return nil, err
+		return nil, 0, err
 	}
-	paths := make([]string, 0, len(result.Hits))
+	hits := make([]scoredHit, 0, len(result.Hits))
 	for _, hit := range result.Hits {
-		paths = append(paths, hit.ID)
+		hits = append(hits, scoredHit{Path: hit.ID, Score: hit.Score})
 	}
-	return paths, nil
+	return hits, int(result.Total), nil
 }
 
 func commandSummary(store *Store, idx taskIndex) error {
@@ -1540,6 +1757,9 @@ func commandSearch(store *Store, idx taskIndex, args []string) error {
 	limit := fs.Int("limit", 20, "")
 	include := fs.Bool("include-content", false, "")
 	brief := fs.Bool("brief", false, "")
+	all := fs.Bool("all", false, "")
+	sortBy := fs.String("sort", "hybrid", "")
+	noSynonyms := fs.Bool("no-synonyms", false, "")
 	if err := parseInterspersed(fs, args); err != nil {
 		return err
 	}
@@ -1578,42 +1798,74 @@ func commandSearch(store *Store, idx taskIndex, args []string) error {
 				filtered = append(filtered, task)
 			}
 		}
-		sort.Slice(filtered, func(i, j int) bool {
-			left, right := priorityRank(filtered[i].Priority), priorityRank(filtered[j].Priority)
-			if left != right {
-				return left < right
-			}
-			return filtered[i].ID < filtered[j].ID
-		})
-		if len(filtered) > *limit {
+		switch strings.ToLower(*sortBy) {
+		case "recency", "recent", "date":
+			sort.Slice(filtered, func(i, j int) bool {
+				di, dj := taskDate(filtered[i]), taskDate(filtered[j])
+				if !di.Equal(dj) {
+					return di.After(dj)
+				}
+				return filtered[i].ID < filtered[j].ID
+			})
+		default: // "priority", "score", etc.
+			sort.Slice(filtered, func(i, j int) bool {
+				left, right := priorityRank(filtered[i].Priority), priorityRank(filtered[j].Priority)
+				if left != right {
+					return left < right
+				}
+				return filtered[i].ID < filtered[j].ID
+			})
+		}
+		total := len(filtered)
+		if !*all && len(filtered) > *limit {
 			filtered = filtered[:*limit]
 		}
-		emitSearch(query, *status, *prefix, *project, "filesystem", filtered, *include, *brief, nil)
+		emitSearch(query, *status, *prefix, *project, "filesystem", filtered, total, *include, *brief, nil)
 		return nil
 	}
-	// Post-filtering can only remove hits, so ask the index for more than the
-	// caller wants whenever a filter still has to be applied afterwards.
-	indexLimit := *limit
-	if len(priorities) > 0 || len(statuses) > 1 {
-		indexLimit = *limit * 8
-		if indexLimit > 1000 {
-			indexLimit = 1000
+
+	searchLimit := *limit
+	if *all {
+		searchLimit = 0
+	} else if len(priorities) > 0 || len(statuses) > 1 {
+		searchLimit = *limit * 8
+		if searchLimit > 1000 {
+			searchLimit = 1000
 		}
 	}
-	hits, sync, err := idx.search(store, query, indexStatus, strings.ToUpper(*prefix), strings.ToUpper(*project), indexLimit, *include)
+
+	hits, totalMatches, sync, err := idx.searchWithOptions(store, searchOptions{
+		Query:               query,
+		Status:              indexStatus,
+		Prefix:              strings.ToUpper(*prefix),
+		Project:             strings.ToUpper(*project),
+		Limit:               searchLimit,
+		IncludeAssetContent: *include,
+		Sort:                *sortBy,
+		NoSynonyms:          *noSynonyms,
+	})
 	if err != nil {
 		return err
 	}
-	tasks := make([]*Task, 0, len(hits))
+
+	var kept []*Task
 	for _, task := range hits {
 		if keep(task) {
-			tasks = append(tasks, task)
-		}
-		if len(tasks) >= *limit {
-			break
+			kept = append(kept, task)
 		}
 	}
-	emitSearch(query, *status, *prefix, *project, "bleve", tasks, *include, *brief, sync)
+
+	total := totalMatches
+	if len(priorities) > 0 || len(statuses) > 1 {
+		total = len(kept)
+	}
+
+	tasks := kept
+	if !*all && len(tasks) > *limit {
+		tasks = tasks[:*limit]
+	}
+
+	emitSearch(query, *status, *prefix, *project, "bleve", tasks, total, *include, *brief, sync)
 	return nil
 }
 
@@ -1994,7 +2246,7 @@ func priorityRank(value string) int {
 	return 6
 }
 
-func emitSearch(query, status, prefix, project, source string, tasks []*Task, include, brief bool, sync map[string]interface{}) {
+func emitSearch(query, status, prefix, project, source string, tasks []*Task, total int, include, brief bool, sync map[string]interface{}) {
 	results := make([]map[string]interface{}, 0, len(tasks))
 	for _, task := range tasks {
 		if brief {
@@ -2007,7 +2259,7 @@ func emitSearch(query, status, prefix, project, source string, tasks []*Task, in
 		}
 		results = append(results, item)
 	}
-	emit(map[string]interface{}{"query": query, "status": emptyNil(status), "prefix": emptyNil(prefix), "project": emptyNil(project), "source": source, "results": results, "sync": sync})
+	emit(map[string]interface{}{"query": query, "status": emptyNil(status), "prefix": emptyNil(prefix), "project": emptyNil(project), "source": source, "total": total, "results": results, "sync": sync})
 }
 
 func briefTaskMap(task *Task) map[string]interface{} {
@@ -2015,9 +2267,21 @@ func briefTaskMap(task *Task) map[string]interface{} {
 }
 
 func snippet(content, query string) string {
-	needle := strings.ToLower(strings.TrimSpace(query))
 	lower := strings.ToLower(content)
+	needle := strings.ToLower(strings.TrimSpace(query))
 	at := strings.Index(lower, needle)
+	if at < 0 {
+		for _, word := range strings.Fields(query) {
+			clean := strings.Trim(strings.ToLower(word), ".,;:!?'\"()[]{}")
+			if len(clean) > 2 {
+				if idx := strings.Index(lower, clean); idx >= 0 {
+					at = idx
+					needle = clean
+					break
+				}
+			}
+		}
+	}
 	if at < 0 {
 		if len(content) > 220 {
 			return content[:220]
@@ -2028,7 +2292,7 @@ func snippet(content, query string) string {
 	if start < 0 {
 		start = 0
 	}
-	end := at + len(query) + 180
+	end := at + len(needle) + 180
 	if end > len(content) {
 		end = len(content)
 	}

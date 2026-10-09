@@ -1014,3 +1014,75 @@ func TestHelpRequestParsing(t *testing.T) {
 		t.Error("expected note command to run and fail on a missing task")
 	}
 }
+
+func TestSearchSynonymsRecencyAndLimits(t *testing.T) {
+	tasks := sandboxRun(t)
+
+	if err := tasks("create", "--title", "Harvest web sessions", "--prefix", "OP", "--description", "Harvesting session transcripts nightly."); err != nil {
+		t.Fatal(err)
+	}
+	if err := tasks("create", "--title", "Old scraper task", "--prefix", "OP", "--description", "An old scraper task from long ago."); err != nil {
+		t.Fatal(err)
+	}
+
+	// 1. Synonym search: searching "scrape" should match "Harvest web sessions" via synonym expansion
+	search := captureRun(t, tasks, "search", "scrape")
+	ids := nextIDs(t, search)
+	foundHarvest := false
+	for _, id := range ids {
+		if id == "OP-001" {
+			foundHarvest = true
+			break
+		}
+	}
+	if !foundHarvest {
+		t.Fatalf("expected search 'scrape' to match OP-001 via synonym expansion, got ids: %v", ids)
+	}
+	if total, ok := search["total"].(float64); !ok || total < 2 {
+		t.Fatalf("expected total >= 2 in search output, got %v", search["total"])
+	}
+
+	// 2. Disabling synonyms with --no-synonyms should NOT match OP-001 for 'scrape'
+	searchNoSyn := captureRun(t, tasks, "search", "scrape", "--no-synonyms")
+	idsNoSyn := nextIDs(t, searchNoSyn)
+	for _, id := range idsNoSyn {
+		if id == "OP-001" {
+			t.Fatalf("expected OP-001 NOT to match with --no-synonyms, got: %v", idsNoSyn)
+		}
+	}
+
+	// 3. Multi-word synonym query: "scrape history" should match OP-001 ("Harvest ... transcripts")
+	searchMulti := captureRun(t, tasks, "search", "scrape history")
+	idsMulti := nextIDs(t, searchMulti)
+	foundMulti := false
+	for _, id := range idsMulti {
+		if id == "OP-001" {
+			foundMulti = true
+			break
+		}
+	}
+	if !foundMulti {
+		t.Fatalf("expected 'scrape history' to match OP-001 via multi-word synonym expansion, got: %v", idsMulti)
+	}
+
+	// 4. Test --limit and --all
+	searchLimited := captureRun(t, tasks, "search", "harvest", "--limit", "1")
+	if len(nextIDs(t, searchLimited)) != 1 {
+		t.Fatalf("expected limit 1 to return 1 item, got: %v", len(nextIDs(t, searchLimited)))
+	}
+	if total, ok := searchLimited["total"].(float64); !ok || total < 2 {
+		t.Fatalf("expected total count to report true total >= 2, got: %v", searchLimited["total"])
+	}
+
+	searchAll := captureRun(t, tasks, "search", "harvest", "--all")
+	if len(nextIDs(t, searchAll)) < 2 {
+		t.Fatalf("expected --all to return all matching tasks, got: %v", len(nextIDs(t, searchAll)))
+	}
+
+	// 5. Test --sort recency
+	searchRecent := captureRun(t, tasks, "search", "--sort", "recency", "--brief")
+	recentIDs := nextIDs(t, searchRecent)
+	if len(recentIDs) < 2 {
+		t.Fatalf("expected at least 2 items, got: %v", recentIDs)
+	}
+}
